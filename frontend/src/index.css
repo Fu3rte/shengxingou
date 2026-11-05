@@ -116,6 +116,38 @@
     --radius-4xl: calc(var(--radius) * 2.6);
 }
 
+.chat-markdown {
+  overflow-wrap: anywhere;
+}
+
+.chat-markdown > * + * {
+  margin-top: 0.75rem;
+}
+
+.chat-markdown h1, .chat-markdown h2, .chat-markdown h3,
+.chat-markdown h4, .chat-markdown h5, .chat-markdown h6 {
+  font-weight: 600;
+  line-height: 1.4;
+}
+
+.chat-markdown h1 { font-size: 1.5rem; }
+.chat-markdown h2 { font-size: 1.25rem; }
+.chat-markdown h3 { font-size: 1.125rem; }
+.chat-markdown p { white-space: pre-line; }
+.chat-markdown ul, .chat-markdown ol { padding-left: 1.5rem; }
+.chat-markdown ul { list-style: disc; }
+.chat-markdown ol { list-style: decimal; }
+.chat-markdown a { color: var(--primary); text-decoration: underline; }
+.chat-markdown blockquote { border-left: 3px solid var(--border); padding-left: 1rem; color: var(--muted-foreground); }
+.chat-markdown pre { overflow-x: auto; border-radius: var(--radius); background: var(--muted); padding: 0.75rem; }
+.chat-markdown code { border-radius: 0.25rem; background: var(--muted); padding: 0.125rem 0.25rem; }
+.chat-markdown pre code { background: transparent; padding: 0; }
+.chat-markdown table { border-collapse: collapse; }
+.chat-markdown th, .chat-markdown td { border: 1px solid var(--border); padding: 0.375rem 0.75rem; text-align: left; }
+.chat-markdown th { font-weight: 600; }
+.chat-markdown hr { border-top: 1px solid var(--border); }
+.chat-markdown img { max-width: 100%; height: auto; }
+
 @layer base {
   * {
     @apply border-border outline-ring/50;

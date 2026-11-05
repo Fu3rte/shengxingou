@@ -3,6 +3,8 @@
 import { useCallback, useEffect, useRef, useState } from "react"
 import type { KeyboardEvent } from "react"
 import { PanelRightIcon, SparklesIcon } from "lucide-react"
+import Markdown from "react-markdown"
+import remarkGfm from "remark-gfm"
 
 import { Button } from "@/components/ui/button"
 import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@/components/ui/empty"
@@ -157,7 +159,15 @@ export function Chat() {
                           )
                         })}
                         {message.role === "assistant" && message.content && (
-                          <div className="whitespace-pre-wrap px-1 leading-7">{message.content}</div>
+                          <div className="chat-markdown px-1 leading-7">
+                            <Markdown
+                              remarkPlugins={[remarkGfm]}
+                              skipHtml
+                              components={{ table: ({ node, ...props }) => <div className="overflow-x-auto"><table {...props} /></div> }}
+                            >
+                              {message.content}
+                            </Markdown>
+                          </div>
                         )}
                       </div>
                     ))}
