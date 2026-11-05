@@ -181,8 +181,8 @@ export function Chat() {
             if (content.trim()) void send("/api/turns", { content })
           }}>
             <div className="mx-auto w-full max-w-3xl space-y-2">
-              {error && <p role="alert" className="px-2 text-sm text-destructive">{error}</p>}
-              <div className="flex items-center gap-2 rounded-4xl border border-input bg-input/30 px-3 py-2 transition-colors focus-within:border-ring focus-within:ring-[3px] focus-within:ring-ring/50">
+              {error && <p role="alert" className="px-3 text-sm text-destructive">{error}</p>}
+              <div className="flex items-end gap-1.5 rounded-2xl border border-border bg-card p-2 shadow-[0_1px_2px_oklch(0_0_0/0.05)] transition-colors focus-within:border-ring focus-within:ring-[3px] focus-within:ring-ring/15">
                 <label htmlFor="message" className="sr-only">消息</label>
                 <Textarea
                   ref={textareaRef}
@@ -195,14 +195,29 @@ export function Chat() {
                   disabled={!!running || pending}
                   placeholder="给助手发消息…"
                   rows={1}
-                  className="max-h-40 min-h-9 flex-1 resize-none border-0 bg-transparent px-0 py-0 shadow-none focus-visible:ring-0"
+                  className="max-h-40 min-h-6 flex-1 resize-none rounded-lg border-0 bg-transparent px-2.5 py-1 text-sm leading-6 shadow-none focus-visible:ring-0"
                 />
-                <div className="flex shrink-0 items-center gap-2">
-                  {running && <Button type="button" variant="outline" size="sm" disabled={pending || running.status === "stopping"} onClick={() => void send(`/api/turns/${running.id}/stop`)}>停止</Button>}
-                  <Button type="submit" size="sm" disabled={pending || !!running || !content.trim()}>发送</Button>
-                </div>
+                {running && (
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    className="rounded-lg transition-colors"
+                    disabled={pending || running.status === "stopping"}
+                    onClick={() => void send(`/api/turns/${running.id}/stop`)}
+                  >
+                    停止
+                  </Button>
+                )}
+                <Button
+                  type="submit"
+                  size="sm"
+                  className="rounded-lg px-3.5 transition-colors disabled:bg-muted disabled:text-muted-foreground disabled:opacity-100"
+                  disabled={pending || !!running || !content.trim()}
+                >
+                  发送
+                </Button>
               </div>
-              <p className="px-2 text-xs text-muted-foreground">Enter 发送，Shift + Enter 换行</p>
             </div>
           </form>
         </div>

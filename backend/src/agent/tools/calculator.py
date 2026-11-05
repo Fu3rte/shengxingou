@@ -14,8 +14,7 @@ class Calculation(BaseModel):
     right: str = Field(description="十进制数字字符串")
 
 
-def calculate(arguments: str) -> str:
-    calculation = Calculation.model_validate_json(arguments)
+def calculate(calculation: Calculation) -> str:
     operations = {
         "+": operator.add,
         "-": operator.sub,
@@ -27,13 +26,3 @@ def calculate(arguments: str) -> str:
         raise ValueError("计算器只接受有限数字")
     result = operations[calculation.operator](left, right)
     return json.dumps({"result": str(result)})
-
-
-TOOLS = [{
-    "type": "function",
-    "function": {
-        "name": "calculate",
-        "description": "计算两个数字的加、减、乘或除。",
-        "parameters": Calculation.model_json_schema(),
-    },
-}]

@@ -24,8 +24,7 @@ class WeatherQuery(BaseModel):
     location: str = Field(min_length=1, description="城市名")
 
 
-def weather(arguments: str) -> str:
-    request = WeatherQuery.model_validate_json(arguments)
+def weather(request: WeatherQuery) -> str:
     location = request.location.strip()
     if not location:
         raise ValueError("地点不能为空")

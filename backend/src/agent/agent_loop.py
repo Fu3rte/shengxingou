@@ -7,7 +7,7 @@ from collections.abc import Callable
 from dotenv import load_dotenv
 from openai import OpenAI
 
-from .tools.calculator import TOOLS, calculate
+from .tools.registry import registry
 
 
 def agent_loop(
@@ -26,7 +26,7 @@ def agent_loop(
         response = client.chat.completions.create(
             model=model,
             messages=messages,
-            tools=TOOLS,
+            tools=registry.declarations(),
         )
         turns += 1
         if stop is not None and stop.is_set():
@@ -49,10 +49,10 @@ def agent_loop(
         for call in message.tool_calls:
             if stop is not None and stop.is_set():
                 return None
-            if call.type != "function" or call.function.name != "calculate":
-                raise ValueError("未知工具")
-            result = calculate(call.function.arguments)
-            print(f"calculate {call.function.arguments} -> {result}", flush=True)
+            if call.type != "function":
+                raise ValueError("未知工具类型")
+            result = registry.execute(call.function.name, call.function.arguments)
+            print(f"{call.function.name} {call.function.arguments} -> {result}", flush=True)
             messages.append({"role": "tool", "tool_call_id": call.id, "content": result})
             if on_update is not None:
                 on_update()

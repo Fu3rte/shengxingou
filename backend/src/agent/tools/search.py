@@ -73,8 +73,7 @@ class SearchQuery(BaseModel):
     limit: int = Field(default=5, ge=1, le=10, description="返回结果条数，1 到 10")
 
 
-def search(arguments: str) -> str:
-    request = SearchQuery.model_validate_json(arguments)
+def search(request: SearchQuery) -> str:
     needle = request.query.strip().casefold()
     if not needle:
         raise ValueError("搜索关键词不能为空")

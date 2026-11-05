@@ -51,24 +51,22 @@ class TodoList:
                 raise ValueError(f"任务不存在: {item_id}")
             return dict(item)
 
-
-def todo(arguments: str, store: TodoList) -> str:
-    command = TodoCommand.model_validate_json(arguments)
-    match command.action:
-        case "add":
-            if command.title is None:
-                raise ValueError("add 需要 title")
-            title = command.title.strip()
-            if not title:
-                raise ValueError("标题不能为空")
-            return json.dumps({"item": store.add(title)}, ensure_ascii=False)
-        case "list":
-            return json.dumps({"items": store.snapshot()}, ensure_ascii=False)
-        case "set_status":
-            if command.id is None or command.status is None:
-                raise ValueError("set_status 需要 id 与 status")
-            return json.dumps({"item": store.set_status(command.id, command.status)}, ensure_ascii=False)
-        case "delete":
-            if command.id is None:
-                raise ValueError("delete 需要 id")
-            return json.dumps({"deleted": store.delete(command.id)}, ensure_ascii=False)
+    def execute(self, command: TodoCommand) -> str:
+        match command.action:
+            case "add":
+                if command.title is None:
+                    raise ValueError("add 需要 title")
+                title = command.title.strip()
+                if not title:
+                    raise ValueError("标题不能为空")
+                return json.dumps({"item": self.add(title)}, ensure_ascii=False)
+            case "list":
+                return json.dumps({"items": self.snapshot()}, ensure_ascii=False)
+            case "set_status":
+                if command.id is None or command.status is None:
+                    raise ValueError("set_status 需要 id 与 status")
+                return json.dumps({"item": self.set_status(command.id, command.status)}, ensure_ascii=False)
+            case "delete":
+                if command.id is None:
+                    raise ValueError("delete 需要 id")
+                return json.dumps({"deleted": self.delete(command.id)}, ensure_ascii=False)
