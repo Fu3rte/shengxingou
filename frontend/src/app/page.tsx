@@ -1,3 +1,5 @@
+import { Chat } from "@/features/agent/chat"
+
 export default function Home() {
-  return <main />
+  return <Chat />
 }

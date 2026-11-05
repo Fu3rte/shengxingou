@@ -20,7 +20,9 @@ out/
 *.tsbuildinfo
 
 # Local tooling and logs
+backend/.data/
 .pi/
+.tool-tmp/
 *.log
 .DS_Store
 Thumbs.db
