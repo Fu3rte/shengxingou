@@ -37,6 +37,8 @@
 
 ## 上下文压缩
 
+当前 Session 与事件阶段不实现上下文压缩及摘要。以下保留已确定的后续设计。
+
 输入上下文预算上限为 20000 token，估算达到 18000 token 时自动压缩。系统指令、工具声明、历史摘要、近期消息和当前 Run 消息均参与输入预算统计；模型输出占用模型窗口的额外空间。
 
 使用与模型匹配的本地 tokenizer 估算 token；受支持的 OpenAI 模型使用 `tiktoken`。未知模型须显式配置兼容的计数方式，无法计数时直接报错。供应商对请求封装的计数可能存在差异，实际模型窗口也可能小于输入预算与输出所需空间。
@@ -49,9 +51,9 @@
 
 `event` 包含 `run_id`、从 1 开始递增的 `seq`、UTC `time`、`type` 和 `data`。事件保存在会话 JSONL 中，不进入模型上下文。
 
-事件包括 `run.started`、`model.request`、`model.delta`、`model.response`、`tool.started`、`tool.completed`、上下文压缩记录、删除确认请求及用户选择、`steer.queued`、`steer.applied`、`run.completed` 和 `run.finished`。模型与工具事件的 `data` 包含 `turn_index`。异常、停止、超限或中断时，`run.finished` 记录对应状态及可用的错误信息。
+事件包括 `run.started`、`model.request`、`model.delta`、`model.response`、`tool.started`、`tool.completed`、`tool.confirmation_requested`、`tool.confirmation_resolved`、`steer.queued`、`steer.applied`、`run.completed` 和 `run.finished`。上下文压缩记录属于后续设计。模型与工具事件的 `data` 包含 `turn_index`。异常、停止、超限或中断时，`run.finished` 记录对应状态及可用的错误信息。
 
-通过密钥检查的模型请求、原始响应 chunk、聚合响应、工具参数和结果均需记录。异常日志关联 `run_id`，异常继续终止执行。
+通过密钥检查的模型请求、归一化响应片段和完整响应、工具参数及结果均需记录。供应商原始 chunk 和未知扩展不写入记录或推送；归一化事件持久化后用于 SSE 补发。异常日志关联 `run_id`，异常继续终止执行。
 
 ## 事件传输
 

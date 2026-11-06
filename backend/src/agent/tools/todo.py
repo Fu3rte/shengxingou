@@ -10,6 +10,14 @@ TodoStatus = Literal["pending", "in_progress", "completed"]
 TITLE_MAX_LENGTH = 200
 
 
+class TodoItem(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    id: int = Field(ge=1)
+    title: str = Field(min_length=1, max_length=TITLE_MAX_LENGTH)
+    status: TodoStatus
+
+
 class TodoCommand(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
@@ -24,6 +32,17 @@ class TodoList:
         self._lock = Lock()
         self._items: dict[int, dict] = {}
         self._next_id = 1
+
+    @classmethod
+    def restore(cls, items: list[dict], next_id: int) -> "TodoList":
+        validated = [TodoItem.model_validate(item).model_dump() for item in items]
+        ids = {item["id"] for item in validated}
+        if len(ids) != len(validated) or type(next_id) is not int or next_id < 1 or (ids and next_id <= max(ids)):
+            raise ValueError("无效待办快照")
+        store = cls()
+        store._items = {item["id"]: item for item in validated}
+        store._next_id = next_id
+        return store
 
     def add(self, title: str) -> dict:
         with self._lock:

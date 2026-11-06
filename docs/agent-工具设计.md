@@ -32,11 +32,31 @@ Agent Loop 接入待办时，数据按 Session 隔离，同一 Session 的各次
 
 多个工具按顺序执行。工具函数只接收参数模型实例；调用 ID、停止信号和执行事件由循环管理。
 
+## 删除确认事件
+
+确认请求事件的 `type` 为 `tool.confirmation_requested`，`data` 字段全部必填：
+
+```json
+{"type":"tool.confirmation_requested","data":{"turn_index":1,"tool_call_id":"call_1","name":"todo","action":"delete","task":{"id":1,"title":"买牛奶"}}}
+```
+
+`turn_index` 是当前 Turn 序号，`tool_call_id` 是模型返回的工具调用 ID；`name` 固定为 `todo`，`action` 固定为 `delete`。`task` 包含待删除任务的正整数 `id` 和 `title`。
+
+用户选择事件的 `type` 为 `tool.confirmation_resolved`，`data` 字段全部必填：
+
+```json
+{"type":"tool.confirmation_resolved","data":{"turn_index":1,"tool_call_id":"call_1","decision":"approved"}}
+```
+
+`decision` 的取值为 `approved`（确认）或 `rejected`（拒绝）。两个事件通过所属 Session、事件外层 `run_id`、`turn_index` 和 `tool_call_id` 关联。示例展示 `type` 和 `data`；完整事件还包含 `run_id`、`seq` 和 UTC `time`。
+
+每次确认请求只能接受一次用户选择；重复或已失效的选择直接报错。确认、停止和工具启动须串行化，停止生效后不再启动工具。用户停止或服务重启时通过 `run.finished` 记录状态，不因停止或重启额外生成用户选择事件。
+
 ## 错误与停止
 
 未知工具、无效参数、非字符串返回值和工具异常直接终止 Run，并记录失败状态。失败的工具不生成成功的 `tool.completed` 或 `toolResult`。
 
-删除确认通过后继续执行。用户拒绝或停止时，删除不执行，Run 以 `stopped` 结束；此前已完成的工具操作保留。等待确认时服务重启，Run 按既定规则标记为 `interrupted`。确认请求和用户选择写入执行事件并通过 SSE 推送。
+确认事件持久化后通过 SSE 推送。用户确认或拒绝时，先持久化选择事件，再执行相应动作；选择事件写入失败时不得执行删除。用户确认后继续执行；用户拒绝或停止时，删除不执行，Run 以 `stopped` 结束；此前已完成的工具操作保留。等待确认时服务重启，Run 按既定规则标记为 `interrupted`。
 
 停止信号生效后，不再启动新工具。已经开始的同步工具可以继续到返回；执行完成后记录实际结果，再停止 Run。
 
