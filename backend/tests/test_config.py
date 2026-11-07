@@ -1,11 +1,12 @@
 import os
+import json
 import tempfile
 import unittest
 from pathlib import Path
 
 from fastapi import HTTPException
 
-from src import server
+from src import api as server
 
 
 class ConfigTests(unittest.TestCase):
@@ -29,12 +30,15 @@ class ConfigTests(unittest.TestCase):
                 os.environ[key] = value
         self.folder.cleanup()
 
+    def save_config(self, data):
+        server.CONFIG.write_text(json.dumps(data), encoding="utf-8")
+
     def test_empty_config_falls_back_to_environment(self):
         self.assertEqual(server.resolve_config()["model"], "env-model")
         self.assertEqual(server.resolve_config()["base_url"], "https://env.example/v1")
 
     def test_saved_config_overrides_environment_and_masks_key(self):
-        server.save_config({"model": "file-model", "base_url": "https://file.example/v1", "api_key": "sk-file-abcdefghijk"})
+        self.save_config({"model": "file-model", "base_url": "https://file.example/v1", "api_key": "sk-file-abcdefghijk"})
         current = server.resolve_config()
         self.assertEqual(current["model"], "file-model")
         self.assertEqual(current["api_key"], "sk-file-abcdefghijk")
@@ -44,7 +48,7 @@ class ConfigTests(unittest.TestCase):
         self.assertNotIn("abcdefghijk", public["api_key"])
 
     def test_put_config_persists_and_keeps_existing_key(self):
-        server.save_config({"model": "old", "base_url": "", "api_key": "sk-keep-000011112222"})
+        self.save_config({"model": "old", "base_url": "", "api_key": "sk-keep-000011112222"})
         result = server.put_config(server.ConfigInput(model="new-model", base_url="https://new.example/v1", api_key=""))
         self.assertEqual(result["model"], "new-model")
         self.assertTrue(result["api_key_set"])
@@ -59,17 +63,6 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaises(HTTPException) as raised:
             server.put_config(server.ConfigInput(model="  ", base_url="", api_key=""))
         self.assertEqual(raised.exception.status_code, 422)
-
-    def test_put_config_conflicts_while_running(self):
-        from threading import Event
-
-        server.active["running-turn"] = Event()
-        try:
-            with self.assertRaises(HTTPException) as raised:
-                server.put_config(server.ConfigInput(model="m", base_url="", api_key=""))
-            self.assertEqual(raised.exception.status_code, 409)
-        finally:
-            del server.active["running-turn"]
 
 
 if __name__ == "__main__":

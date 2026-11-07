@@ -7,7 +7,7 @@
 | 类型 | 字段 | 说明 |
 | --- | --- | --- |
 | `session` | `version`、`id`、`created_at` | 格式版本、会话 ID、UTC 创建时间 |
-| `message` | `id`、`timestamp`、`run_id`、`message` | 保存一条 `AgentMessage` |
+| `message` | `id`、`timestamp`、`run_id`、`message`、可选 `queue_id` | 保存一条 `AgentMessage`，`queue_id` 标识 steering 消息 |
 | `session_info` | `id`、`timestamp`、`title` | 保存会话名称变更 |
 | `event` | `id`、`timestamp`、`event` | 保存一条执行事件 |
 
@@ -31,6 +31,7 @@
 `build_session_context(active_run_id)` 按记录顺序提取所属 Session 的消息，返回线性的 `AgentMessage` 数组。模型适配层过滤自定义消息并转换为供应商格式。
 
 - 历史上下文包含不属于 Run 的系统消息及 `completed` Run 的消息；已压缩的历史使用对应摘要。当前运行由 `active_run_id` 标识，其消息参与本次上下文。
+- 带 `queue_id` 的 steering 消息须有对应的 `steer.applied` 事件才进入上下文；未提交消息保留在记录中。
 - 重试在会话末尾创建新 Run，历史上下文仍只包含已完成 Run 的消息。
 - 发送模型请求前校验工具调用与结果的 ID 配对；不完整的工具调用不能发送。
 - 同一会话同时执行一个运行；不同会话可以并发运行。
@@ -53,7 +54,7 @@
 
 事件包括 `run.started`、`model.request`、`model.delta`、`model.response`、`tool.started`、`tool.completed`、`tool.confirmation_requested`、`tool.confirmation_resolved`、`steer.queued`、`steer.applied`、`run.completed` 和 `run.finished`。上下文压缩记录属于后续设计。模型与工具事件的 `data` 包含 `turn_index`。异常、停止、超限或中断时，`run.finished` 记录对应状态及可用的错误信息。
 
-通过密钥检查的模型请求、归一化响应片段和完整响应、工具参数及结果均需记录。供应商原始 chunk 和未知扩展不写入记录或推送；归一化事件持久化后用于 SSE 补发。异常日志关联 `run_id`，异常继续终止执行。
+通过密钥检查的模型请求、归一化响应片段、可用的响应信息、工具参数及结果均需记录。供应商原始 chunk 和未知扩展不写入记录或推送；归一化事件持久化后用于 SSE 补发。模型事件字段见 `agent-消息转换设计.md`；steering 和终态规则见 `agent-loop-设计.md`。异常日志关联 `run_id`，异常继续终止执行。
 
 ## 事件传输
 
@@ -71,4 +72,5 @@
 
 - 每个 Session 采用单写入者并追加记录。重复 ID 和尾部残缺行视为损坏，停止读取。
 - 会话数据可能包含提示词、工具参数和结果；API key 和环境变量不写入记录。
+- 文件打开后写入、刷新或关闭失败时，当前进程拒绝继续读取该会话；重启后按 JSONL 损坏规则检查。
 - 本机服务仅允许本机访问；会话和日志无自动过期。

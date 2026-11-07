@@ -1,6 +1,7 @@
 """模拟网络搜索：在预置样例集合内做确定性的大小写无关子串匹配，不代表实时联网结果。"""
 
 import json
+from collections.abc import Callable
 from typing import TypedDict
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -73,7 +74,9 @@ class SearchQuery(BaseModel):
     limit: int = Field(default=5, ge=1, le=10, description="返回结果条数，1 到 10")
 
 
-def search(request: SearchQuery) -> str:
+def search(request: SearchQuery, *, start: Callable[[], bool] | None = None) -> str | None:
+    if start is not None and not start():
+        return None
     needle = request.query.strip().casefold()
     if not needle:
         raise ValueError("搜索关键词不能为空")

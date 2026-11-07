@@ -13,6 +13,12 @@
 
 每个 Session 同时最多执行一个 Run；不同 Session 可以并发执行。各 Session 的上下文、steering 队列和停止信号相互隔离。
 
+## 服务调用接口
+
+`backend/src/agent/agent_loop.py` 提供 `AgentLoop(session, client, model)`，其中 `client` 为使用固定 API key 的 `AsyncOpenAI`。客户端仅用于 AgentLoop 的模型事件循环，使用固定凭据和标准 HTTP transport；不支持动态密钥、HTTP event hooks、URL 身份信息、默认查询参数、Cookie 或代理认证。Loop 为客户端禁用 Cookie 的接收与发送；调用期间不得更改凭据。`append_message(content)` 返回所属 `run_id`；`trace(run_id)` 读取事件快照；`events(run_id, after)` 按序交付已持久化事件；`abort(run_id)` 提交停止信号；`confirm(run_id, turn_index, tool_call_id, decision)` 提交删除选择；`wait(run_id, timeout)` 等待执行并传播错误。`close(timeout)` 等待当前操作退出，未结束的 Run 在重新打开时恢复为 `interrupted`。调用方在所有 Run 退出后使用 `close_model_client(client)` 关闭客户端。
+
+这些同步接口不得在模型事件循环线程中调用。其他进程持有同一 Session 的运行锁时，创建或恢复运行直接报锁冲突。接口已通过 HTTP、SSE 接入前端。
+
 ## 消息追加
 
 - 空闲时，`append_message` 创建 Run，追加用户消息并启动循环。
@@ -40,7 +46,14 @@
 
 `abort` 设置停止信号。信号生效后，不再开始新的模型请求或工具。已开始的同步请求或工具可以继续到返回，已产生的外部副作用保留。
 
-模型流进行中收到停止信号时，继续接收并记录当前响应；响应结束后不执行新的工具或模型请求。工具执行完成后记录结果，随后停止。运行实际结束时记录 `stopped`。进程重启后，对缺少终止事件的运行追加状态为 `interrupted` 的 `run.finished`。
+模型流进行中收到停止信号时，继续接收并记录当前响应；响应结束后不执行新的工具或模型请求。工具执行完成后记录结果，随后停止。进程重启后，对缺少终止事件的运行追加状态为 `interrupted` 的 `run.finished`。
+
+停止信号、工具启动、最终结束检查和终态提交须在同一 Session 内串行化：
+
+- 停止在终态持久化前生效时，当前操作正常结束并记录后，Run 以 `stopped` 结束。
+- 终态提交前发生模型、工具或安全错误时，Run 以 `failed` 结束；错误信息须通过安全检查。
+- `run.completed` 已持久化后，停止请求返回已结束，不能覆盖终态。
+- 写入失败导致终态无法持久化时，向调用方报告失败，不生成虚假的终态记录。
 
 ## 执行事件
 
@@ -56,9 +69,23 @@
 | `tool.started`、`tool.completed` | 工具调用 ID、名称、参数和结果 |
 | `tool.confirmation_requested` | Turn 序号、工具调用 ID、名称、操作和待办任务信息 |
 | `tool.confirmation_resolved` | Turn 序号、工具调用 ID 和用户选择 |
-| `steer.queued` | 队列消息 ID 和消息内容 |
-| `steer.applied` | 队列消息 ID 和追加后的消息 ID |
+| `steer.queued` | `queue_id`、`content` |
+| `steer.applied` | `queue_id`、`message_id` |
 | `run.completed` | 最终回答 |
 | `run.finished` | 停止、超限、失败或中断的状态及可用的错误信息 |
+
+`steer.queued.data` 中的 `queue_id` 标识排队消息，`content` 是消息文本：
+
+```json
+{"queue_id":"q1","content":"换一种方式"}
+```
+
+`steer.applied.data` 中的 `queue_id` 关联该消息，`message_id` 标识追加到 Session 的消息记录：
+
+```json
+{"queue_id":"q1","message_id":"m1"}
+```
+
+`model.delta` 和 `model.response` 的数据格式见 `agent-消息转换设计.md`。
 
 供应商原始 chunk 和未知扩展不写入记录或推送。执行事件通过 SSE 推送至前端。本机服务仅允许本机访问；会话和日志无自动过期。执行记录可能包含用户内容、提示词和工具数据；API key 和环境变量不写入记录。

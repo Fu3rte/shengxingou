@@ -1,5 +1,6 @@
 import json
 import operator
+from collections.abc import Callable
 from decimal import Decimal
 from typing import Literal
 
@@ -14,7 +15,9 @@ class Calculation(BaseModel):
     right: str = Field(description="十进制数字字符串")
 
 
-def calculate(calculation: Calculation) -> str:
+def calculate(calculation: Calculation, *, start: Callable[[], bool] | None = None) -> str | None:
+    if start is not None and not start():
+        return None
     operations = {
         "+": operator.add,
         "-": operator.sub,

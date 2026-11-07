@@ -41,6 +41,17 @@ class SessionTodoTests(unittest.TestCase):
         other = self.manager.create()
         self.assertEqual(other.todo_snapshot(), [])
 
+    def test_escaped_secret_does_not_modify_todo(self):
+        session = SessionManager(Path(self.directory.name), secrets=("secret",)).create()
+        session.append_event("run", "run.started", {"input": "x"})
+        arguments = '{"action":"add","title":"\\u0073ecret"}'
+        with self.assertRaisesRegex(ValueError, "密钥"):
+            session.append_event("run", "tool.started", {"turn_index": 1, "tool_call_id": "call", "name": "todo", "arguments": arguments})
+        with self.assertRaisesRegex(ValueError, "密钥"):
+            session.execute_todo("run", 1, "call", arguments)
+        self.assertEqual(session.todo_snapshot(), [])
+        self.assertEqual([event.type for event in session.trace("run")], ["run.started"])
+
     def test_result_security_failure_does_not_commit_in_memory(self):
         manager = SessionManager(Path(self.directory.name), secrets=("pending",))
         session = manager.create()

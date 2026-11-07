@@ -2,8 +2,9 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, JsonValue, TypeAdapter
 
+from ..security import SecretGuard
 from .calculator import Calculation, calculate
 from .search import SearchQuery, search
 from .todo import TodoCommand, TodoList
@@ -15,7 +16,7 @@ class ToolDefinition[Parameters: BaseModel]:
     name: str
     description: str
     parameters: type[Parameters]
-    execute: Callable[[Parameters], str]
+    execute: Callable[..., str | None]
 
 
 class ToolRegistry:
@@ -42,10 +43,17 @@ class ToolRegistry:
             for tool in self._tools.values()
         ]
 
-    def execute(self, name: str, arguments: str) -> str:
+    def execute(self, name: str, arguments: str, *, secrets: tuple[str, ...] = (),
+                start: Callable[[], bool] | None = None) -> str | None:
+        guard = SecretGuard(secrets)
+        guard.check({"name": name, "arguments": arguments})
         tool = self.get(name)
+        guard.check(TypeAdapter(JsonValue).validate_json(arguments))
         parameters = tool.parameters.model_validate_json(arguments)
-        result = tool.execute(parameters)
+        guard.check(parameters)
+        result = tool.execute(parameters) if start is None else tool.execute(parameters, start=start)
+        if result is None and start is not None:
+            return None
         if not isinstance(result, str):
             raise TypeError(f"工具返回值必须是字符串: {name}")
         return result

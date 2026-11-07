@@ -36,13 +36,7 @@ npm run setup
 
 将 `backend/.env.example` 复制为 `backend/.env`，填写 `OPENAI_API_KEY`、`OPENAI_MODEL` 和需要时使用的 `OPENAI_BASE_URL`。
 
-在项目根目录启动前后端：
-
-```bash
-npm run dev
-```
-
-访问 `http://127.0.0.1:3000`。按 Ctrl+C 停止前后端；端口被占用时，先释放端口。
+在项目根目录运行 `npm run dev`，然后访问 `http://127.0.0.1:3000`。模型和 API Key 也可在页面配置，保存在本机 `backend/.data/config.json`。会话及执行记录保存在 `backend/.data/sessions/`。
 
 ### 后端
 
@@ -51,29 +45,19 @@ cd backend
 uv sync --locked
 ```
 
-启动终端 Agent：
-
-```bash
-uv run python -m src.agent.agent_loop
-```
-
-输入问题后按回车。Agent 在需要计算时调用四则运算工具，并输出工具调用与最终回答。计算使用 Decimal 默认精度（28 位有效数字）。输入结束符退出（Windows 使用 Ctrl+Z 后按回车，macOS/Linux 使用 Ctrl+D）。
-
-工具调用循环没有轮次上限，会产生模型调用费用。除零、无效参数和 API 错误会直接终止程序。
-
 运行测试：
 
 ```bash
 uv run python -m unittest discover -s tests
 ```
 
-启动本机 API：
+仅在本机启动 API（单进程）：
 
 ```bash
-uv run python -m src.dev_server
+uv run uvicorn src.api:app --host 127.0.0.1 --port 8765 --no-access-log
 ```
 
-网页对话以明文保存在 `backend/.data/conversations.json`，包含消息和工具结果。每次发送最多请求模型 64 次；停止后不再发起新一轮，已发出的请求可能继续。程序重启时，未完成的任务标记为中断，可手动重试。网页接口仅支持本机单进程运行。
+`backend/src/agent/agent_loop.py` 提供 Agent Loop 接口，会话和执行记录保存在 Session JSONL 文件中。
 
 ### 前端
 

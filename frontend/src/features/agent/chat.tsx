@@ -2,12 +2,9 @@
 
 import { useCallback, useEffect, useRef, useState } from "react"
 import type { KeyboardEvent } from "react"
-import { PanelRightIcon, SparklesIcon } from "lucide-react"
 import Markdown from "react-markdown"
 import remarkGfm from "remark-gfm"
-
 import { Button } from "@/components/ui/button"
-import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@/components/ui/empty"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Separator } from "@/components/ui/separator"
 import { SidebarInset, SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar"
@@ -15,237 +12,185 @@ import { Textarea } from "@/components/ui/textarea"
 import { ModelConfig } from "@/features/agent/model-config"
 import { SessionSidebar } from "@/features/agent/session-sidebar"
 
-const COMPOSITION_GRACE = 100
-
-type ToolCall = { id: string; function: { name: string; arguments: string } }
-type Message = { role: string; content: string | null; tool_calls?: ToolCall[]; tool_call_id?: string }
-type Turn = { id: string; status: string; messages: Message[]; error?: string }
-
-const statusText: Record<string, string> = {
-  running: "执行中",
-  stopping: "停止中",
-  stopped: "已停止",
-  limited: "达到轮次上限",
-  interrupted: "执行中断",
-  failed: "执行失败",
-}
+type AgentEvent = { run_id: string; seq: number; time: string; type: string; data: Record<string, any> }
+type Session = { id: string; title: string }
+type RecordItem = { type: string; event?: AgentEvent }
+const terminal = (event?: AgentEvent) => event && ["run.completed", "run.finished"].includes(event.type)
+const statuses: Record<string, string> = { stopped: "已停止", limited: "达到轮次上限", interrupted: "执行中断", failed: "执行失败" }
 
 export function Chat() {
-  const [turns, setTurns] = useState<Turn[]>([])
+  const [sessions, setSessions] = useState<Session[]>([])
+  const [session, setSession] = useState("")
+  const [order, setOrder] = useState<string[]>([])
+  const [events, setEvents] = useState<Record<string, AgentEvent[]>>({})
   const [content, setContent] = useState("")
   const [pending, setPending] = useState(false)
   const [error, setError] = useState("")
   const [configOpen, setConfigOpen] = useState(false)
   const [model, setModel] = useState("")
+  const [generation, setGeneration] = useState(0)
+  const initialized = useRef(false)
+  const currentSession = useRef("")
   const composing = useRef(false)
   const composedAt = useRef(0)
-  const textareaRef = useRef<HTMLTextAreaElement>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
-  const running = turns.find((turn) => turn.status === "running" || turn.status === "stopping")
+  const running = Object.values(events).find((items) => items.length && !terminal(items.at(-1)))?.[0]?.run_id
 
-  const refresh = useCallback(async () => {
-    try {
-      const response = await fetch("/api/turns", { cache: "no-store" })
-      if (!response.ok) return
-      setTurns(await response.json())
-    } catch {
-      // 轮询失败时保留上一份数据，等下一次刷新
+  const list = useCallback(async () => {
+    const response = await fetch("/api/sessions", { cache: "no-store" })
+    if (!response.ok) throw new Error("读取会话失败")
+    setSessions(await response.json())
+  }, [])
+  const select = useCallback((id: string) => {
+    currentSession.current = id
+    sessionStorage.setItem("agent-session", id)
+    setEvents({})
+    setOrder([])
+    setSession(id)
+    setError("")
+  }, [])
+  const create = useCallback(async () => {
+    const response = await fetch("/api/sessions", { method: "POST" })
+    if (!response.ok) throw new Error("创建会话失败")
+    const result = await response.json()
+    select(result.id)
+    await list()
+  }, [list, select])
+
+  useEffect(() => {
+    if (initialized.current) return
+    initialized.current = true
+    const navigation = performance.getEntriesByType("navigation")[0] as PerformanceNavigationTiming | undefined
+    if (window.opener && navigation?.type === "navigate") sessionStorage.removeItem("agent-session")
+    const saved = sessionStorage.getItem("agent-session")
+    if (saved) select(saved)
+    else void create()
+    void list()
+    void fetch("/api/config").then((response) => {
+      if (!response.ok) throw new Error("读取配置失败")
+      return response.json()
+    }).then((config) => setModel(config.model))
+  }, [create, list, select])
+
+  useEffect(() => {
+    if (!session) return
+    let cancelled = false
+    const streams: EventSource[] = []
+    async function load() {
+      const response = await fetch(`/api/sessions/${session}`, { cache: "no-store" })
+      if (!response.ok) throw new Error("读取会话失败")
+      const result = await response.json()
+      const ids = [...new Set<string>((result.records as RecordItem[]).filter((record) => record.type === "event").map((record) => record.event!.run_id))]
+      if (!cancelled) setOrder(ids)
+      await Promise.all(ids.map(async (id) => {
+        const path = `/api/sessions/${session}/runs/${id}`
+        const snapshot = await fetch(`${path}/events`, { cache: "no-store" })
+        if (!snapshot.ok) throw new Error("读取执行记录失败")
+        const items: AgentEvent[] = await snapshot.json()
+        if (cancelled) return
+        setEvents((previous) => ({ ...previous, [id]: items }))
+        if (terminal(items.at(-1))) return
+        const stream = new EventSource(`${path}/stream?after=${items.at(-1)?.seq ?? 0}`)
+        streams.push(stream)
+        stream.onmessage = (message) => {
+          if (cancelled) return
+          setError("")
+          const event: AgentEvent = JSON.parse(message.data)
+          setEvents((previous) => {
+            const current = previous[id] ?? []
+            if (current.some((item) => item.seq === event.seq)) return previous
+            return { ...previous, [id]: [...current, event].sort((a, b) => a.seq - b.seq) }
+          })
+          if (terminal(event)) stream.close()
+        }
+        stream.onerror = () => { if (!cancelled) setError("执行记录连接失败") }
+      }))
     }
-  }, [])
-
-  useEffect(() => {
-    void refresh()
-    const timer = window.setInterval(() => void refresh(), 1000)
-    return () => window.clearInterval(timer)
-  }, [refresh])
-
-  useEffect(() => {
-    void (async () => {
-      try {
-        const response = await fetch("/api/config", { cache: "no-store" })
-        if (!response.ok) return
-        const config = await response.json()
-        setModel(config.model ?? "")
-      } catch {
-        // 配置读不到时保持未配置状态
-      }
-    })()
-  }, [])
+    void load()
+    return () => { cancelled = true; streams.forEach((stream) => stream.close()) }
+  }, [session, generation])
 
   useEffect(() => {
     const viewport = scrollRef.current?.querySelector<HTMLElement>('[data-slot="scroll-area-viewport"]')
     if (viewport) viewport.scrollTop = viewport.scrollHeight
-  }, [turns])
+  }, [events])
 
-  function handleKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
-    if (event.key !== "Enter" || event.shiftKey) return
-    const composingNow = composing.current || event.nativeEvent.isComposing || event.keyCode === 229
-    const justComposed = Date.now() - composedAt.current < COMPOSITION_GRACE
-    if (composingNow || justComposed) {
-      if (justComposed) event.preventDefault()
-      return
-    }
-    event.preventDefault()
-    if (!running && !pending && content.trim()) void send("/api/turns", { content })
-  }
-
-  function newSession() {
-    setContent("")
-    setError("")
-    textareaRef.current?.focus()
-  }
-
-  async function send(path: string, body?: object) {
+  async function post(path: string, body?: object) {
     setPending(true)
     setError("")
     try {
-      const response = await fetch(path, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: body ? JSON.stringify(body) : undefined,
-      })
+      const response = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: body ? JSON.stringify(body) : undefined })
       if (!response.ok) {
         const result = await response.json()
-        setError(typeof result.detail === "string" ? result.detail : "请求失败")
-      } else {
-        if (body) setContent("")
-        await refresh()
+        throw new Error(typeof result.detail === "string" ? result.detail : "请求失败")
       }
-    } finally {
-      setPending(false)
+      return true
+    } finally { setPending(false) }
+  }
+  async function send() {
+    if (!session || !content.trim() || pending) return
+    const sentSession = session
+    if (await post(`/api/sessions/${sentSession}/messages`, { content }) && currentSession.current === sentSession) {
+      setContent("")
+      setGeneration((value) => value + 1)
     }
+  }
+  function keyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
+    if (event.key !== "Enter" || event.shiftKey) return
+    if (composing.current || event.nativeEvent.isComposing || event.keyCode === 229) return
+    event.preventDefault()
+    if (Date.now() - composedAt.current >= 100) void send()
   }
 
   return (
     <SidebarProvider className="h-dvh min-h-0 overflow-hidden">
-      <SessionSidebar model={model} onNewSession={newSession} onOpenConfig={() => setConfigOpen(true)} />
+      <SessionSidebar model={model} sessions={sessions} current={session} onSelect={select} onNewSession={() => void create()} onOpenConfig={() => setConfigOpen(true)} />
       <SidebarInset className="h-dvh min-h-0 overflow-hidden">
         <header className="flex h-12 shrink-0 items-center gap-2 border-b px-3">
-          <SidebarTrigger className="-ml-1" />
-          <Separator orientation="vertical" className="h-4!" />
-          <span className="truncate text-sm font-medium">新会话</span>
+          <SidebarTrigger className="-ml-1" /><Separator orientation="vertical" className="h-4!" />
+          <span className="truncate text-sm font-medium">{sessions.find((item) => item.id === session)?.title || "会话"}</span>
         </header>
-        <div className="flex min-h-0 flex-1 flex-col">
-          {turns.length === 0 ? (
-            <div className="flex flex-1 items-center justify-center px-6">
-              <Empty className="max-w-md border-0">
-                <EmptyHeader>
-                  <EmptyMedia variant="icon">
-                    <SparklesIcon />
-                  </EmptyMedia>
-                  <EmptyTitle>今天想了解点什么？</EmptyTitle>
-                  <EmptyDescription>输入消息开始对话，或先在侧栏配置模型。</EmptyDescription>
-                </EmptyHeader>
-              </Empty>
+        <ScrollArea ref={scrollRef} className="min-h-0 flex-1">
+          <section aria-label="对话" aria-live="polite" className="mx-auto w-full max-w-3xl space-y-8 px-4 py-8 sm:px-6">
+            {order.filter((id) => events[id]?.length).map((id) => {
+              const items = events[id]
+              const run = items[0].run_id
+              const last = items.at(-1)
+              return <article key={run} className="space-y-4">
+                {items.map((event) => {
+                  const data = event.data
+                  if (event.type === "run.started" || event.type === "steer.queued") return <div key={event.seq} className="ml-auto w-fit max-w-[85%] whitespace-pre-wrap rounded-3xl bg-secondary px-4 py-2.5">{event.type === "run.started" ? data.input : data.content}</div>
+                  if (event.type === "model.request") {
+                    const text = items.filter((item) => item.type === "model.delta" && item.data.turn_index === data.turn_index).map((item) => item.data.fragments.text || "").join("")
+                    return text ? <div key={event.seq} className="chat-markdown px-1 leading-7"><Markdown remarkPlugins={[remarkGfm]} skipHtml>{text}</Markdown></div> : null
+                  }
+                  if (event.type === "tool.started") {
+                    const result = items.find((item) => item.type === "tool.completed" && item.data.turn_index === data.turn_index && item.data.tool_call_id === data.tool_call_id)
+                    return <details key={event.seq} className="rounded-xl border bg-card px-4 py-3 text-sm"><summary className="cursor-pointer font-medium">{data.name}</summary><pre className="mt-2 overflow-x-auto whitespace-pre-wrap break-all">{data.arguments}</pre>{result && <pre className="mt-2 overflow-x-auto whitespace-pre-wrap break-all">{result.data.result}</pre>}</details>
+                  }
+                  if (event.type === "tool.confirmation_requested" && !terminal(last) && !items.some((item) => item.type === "tool.confirmation_resolved" && item.data.turn_index === data.turn_index && item.data.tool_call_id === data.tool_call_id)) return <div key={event.seq} className="rounded-xl border p-4 space-y-3"><p>删除待办 {data.task.id}：{data.task.title}</p><div className="flex gap-2">{(["approved", "rejected"] as const).map((decision) => <Button key={decision} disabled={pending} variant={decision === "approved" ? "default" : "outline"} onClick={() => void post(`/api/sessions/${session}/runs/${run}/confirm`, { turn_index: data.turn_index, tool_call_id: data.tool_call_id, decision })}>{decision === "approved" ? "确认删除" : "拒绝"}</Button>)}</div></div>
+                  if (event.type === "run.finished") return <p key={event.seq} className="text-sm text-muted-foreground">{statuses[data.status] || data.status}{data.error ? `：${data.error}` : ""}</p>
+                  return null
+                })}
+              </article>
+            })}
+          </section>
+        </ScrollArea>
+        <form className="shrink-0 px-4 pb-4 pt-2 sm:px-6" onSubmit={(event) => { event.preventDefault(); void send() }}>
+          <div className="mx-auto w-full max-w-3xl space-y-2">
+            {error && <p role="alert" className="px-3 text-sm text-destructive">{error}</p>}
+            <div className="flex items-end gap-1.5 rounded-2xl border bg-card p-2">
+              <label htmlFor="message" className="sr-only">消息</label>
+              <Textarea id="message" value={content} onChange={(event) => setContent(event.target.value)} onKeyDown={keyDown} onCompositionStart={() => { composing.current = true }} onCompositionEnd={() => { composing.current = false; composedAt.current = Date.now() }} disabled={pending || !session} rows={1} className="max-h-40 min-h-6 flex-1 resize-none border-0 bg-transparent px-2.5 py-1 shadow-none focus-visible:ring-0" />
+              {running && <Button type="button" variant="ghost" size="sm" disabled={pending} onClick={() => void post(`/api/sessions/${session}/runs/${running}/stop`)}>停止</Button>}
+              <Button type="submit" size="sm" disabled={pending || !session || !content.trim()}>发送</Button>
             </div>
-          ) : (
-            <ScrollArea ref={scrollRef} className="min-h-0 flex-1">
-              <section aria-label="对话" aria-live="polite" className="mx-auto w-full max-w-3xl space-y-8 px-4 py-8 sm:px-6">
-                {turns.map((turn) => (
-                  <article key={turn.id} className="space-y-4">
-                    <div className="ml-auto w-fit max-w-[85%] whitespace-pre-wrap rounded-3xl bg-secondary px-4 py-2.5">
-                      {turn.messages[0].content}
-                    </div>
-                    {turn.status !== "running" && turn.status !== "stopping" && turn.messages.slice(1).map((message, index) => (
-                      <div key={index} className="space-y-2">
-                        {message.tool_calls?.map((call) => {
-                          const result = turn.messages.find((item) => item.role === "tool" && item.tool_call_id === call.id)
-                          return (
-                            <details key={call.id} className="rounded-xl border bg-card px-4 py-3 text-sm">
-                              <summary className="cursor-pointer font-medium">{call.function.name}</summary>
-                              <pre className="mt-2 overflow-x-auto whitespace-pre-wrap break-all">{call.function.arguments}</pre>
-                              {result && <pre className="mt-2 overflow-x-auto whitespace-pre-wrap break-all">{result.content}</pre>}
-                            </details>
-                          )
-                        })}
-                        {message.role === "assistant" && message.content && (
-                          <div className="chat-markdown px-1 leading-7">
-                            <Markdown
-                              remarkPlugins={[remarkGfm]}
-                              skipHtml
-                              components={{ table: ({ node, ...props }) => <div className="overflow-x-auto"><table {...props} /></div> }}
-                            >
-                              {message.content}
-                            </Markdown>
-                          </div>
-                        )}
-                      </div>
-                    ))}
-                    {statusText[turn.status] && (
-                      <div className="flex items-center gap-3 text-sm text-muted-foreground">
-                        <span>{statusText[turn.status]}{turn.error && `：${turn.error}`}</span>
-                        {["stopped", "limited", "interrupted", "failed"].includes(turn.status) && (
-                          <Button variant="outline" size="sm" disabled={pending || !!running} onClick={() => void send(`/api/turns/${turn.id}/retry`)}>
-                            重试
-                          </Button>
-                        )}
-                      </div>
-                    )}
-                  </article>
-                ))}
-              </section>
-            </ScrollArea>
-          )}
-          <form className="shrink-0 px-4 pb-4 pt-2 sm:px-6" onSubmit={(event) => {
-            event.preventDefault()
-            if (content.trim()) void send("/api/turns", { content })
-          }}>
-            <div className="mx-auto w-full max-w-3xl space-y-2">
-              {error && <p role="alert" className="px-3 text-sm text-destructive">{error}</p>}
-              <div className="flex items-end gap-1.5 rounded-2xl border border-border bg-card p-2 shadow-[0_1px_2px_oklch(0_0_0/0.05)] transition-colors focus-within:border-ring focus-within:ring-[3px] focus-within:ring-ring/15">
-                <label htmlFor="message" className="sr-only">消息</label>
-                <Textarea
-                  ref={textareaRef}
-                  id="message"
-                  value={content}
-                  onChange={(event) => setContent(event.target.value)}
-                  onKeyDown={handleKeyDown}
-                  onCompositionStart={() => { composing.current = true }}
-                  onCompositionEnd={() => { composing.current = false; composedAt.current = Date.now() }}
-                  disabled={!!running || pending}
-                  placeholder="给助手发消息…"
-                  rows={1}
-                  className="max-h-40 min-h-6 flex-1 resize-none rounded-lg border-0 bg-transparent px-2.5 py-1 text-sm leading-6 shadow-none focus-visible:ring-0"
-                />
-                {running && (
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="sm"
-                    className="rounded-lg transition-colors"
-                    disabled={pending || running.status === "stopping"}
-                    onClick={() => void send(`/api/turns/${running.id}/stop`)}
-                  >
-                    停止
-                  </Button>
-                )}
-                <Button
-                  type="submit"
-                  size="sm"
-                  className="rounded-lg px-3.5 transition-colors disabled:bg-muted disabled:text-muted-foreground disabled:opacity-100"
-                  disabled={pending || !!running || !content.trim()}
-                >
-                  发送
-                </Button>
-              </div>
-            </div>
-          </form>
-        </div>
+          </div>
+        </form>
       </SidebarInset>
       <aside aria-label="面板" className="hidden w-80 shrink-0 flex-col border-l bg-muted/20 xl:flex">
         <div className="flex h-12 shrink-0 items-center border-b px-4">
           <span className="text-sm font-medium text-muted-foreground">面板</span>
-        </div>
-        <div className="flex min-h-0 flex-1 p-3">
-          <Empty className="border border-dashed">
-            <EmptyHeader>
-              <EmptyMedia variant="icon">
-                <PanelRightIcon />
-              </EmptyMedia>
-              <EmptyTitle className="text-base">空白面板</EmptyTitle>
-              <EmptyDescription>详情与工具区预留</EmptyDescription>
-            </EmptyHeader>
-          </Empty>
         </div>
       </aside>
       <ModelConfig open={configOpen} running={!!running} onOpenChange={setConfigOpen} onSaved={setModel} />

@@ -1,6 +1,7 @@
 """自定义天气查询：城市名到模拟天气记录的配置映射，无实时含义。"""
 
 import json
+from collections.abc import Callable
 from typing import TypedDict
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -24,7 +25,11 @@ class WeatherQuery(BaseModel):
     location: str = Field(min_length=1, description="城市名")
 
 
-def weather(request: WeatherQuery) -> str:
+def weather(
+    request: WeatherQuery, *, start: Callable[[], bool] | None = None
+) -> str | None:
+    if start is not None and not start():
+        return None
     location = request.location.strip()
     if not location:
         raise ValueError("地点不能为空")

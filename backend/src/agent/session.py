@@ -1,9 +1,10 @@
 import json
 import os
 import re
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import RLock
 from typing import Annotated, Literal
 from uuid import uuid4
 
@@ -14,7 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter
 from .security import SecretGuard
 from .tools.registry import ToolRegistry
 from .tools.todo import TodoCommand, TodoItem, TodoList
-from .types import AgentMessage, AssistantMessage, SystemMessage, ToolResultMessage
+from .types import AgentMessage, AssistantMessage, SystemMessage, ToolCallContent, ToolResultMessage
 from ..ai.models.normalized import normalized_stream
 from ..ai.models.openai import to_openai_messages
 
@@ -36,6 +37,7 @@ class MessageRecord(RecordModel):
     timestamp: str
     run_id: str | None
     message: AgentMessage
+    queue_id: str | None = Field(default=None, min_length=1)
 
 
 class SessionInfoRecord(RecordModel):
@@ -88,6 +90,10 @@ Record = Annotated[SessionHeader | MessageRecord | SessionInfoRecord | EventReco
 _RECORD = TypeAdapter(Record)
 _ID = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 _TERMINAL = {"run.completed", "run.finished"}
+_LIVE_RUNS_LOCK = RLock()
+_LIVE_RUNS: set[tuple[str, str]] = set()
+_LIVE_LOCKS: dict[str, RLock] = {}
+_WRITE_FAILURES: set[str] = set()
 
 
 def _id(value: str) -> str:
@@ -131,11 +137,24 @@ def _validate_event(event: ExecutionEvent, confirmations: dict[tuple[str, int, s
         ):
             raise ValueError("无效模型流事件")
     if event.type == "model.response":
-        AssistantMessage.model_validate(data.get("message"))
-        if set(data) != {"turn_index", "message", "finish_reason", "usage"} or data.get("finish_reason") not in {"stop", "tool_calls"} or (
-            data.get("usage") is not None and not isinstance(data.get("usage"), dict)
-        ):
+        if (set(data) != {"turn_index", "message", "finish_reason", "usage"}
+                or (data["finish_reason"] is not None and not isinstance(data["finish_reason"], str))
+                or (data["usage"] is not None and not isinstance(data["usage"], dict))):
             raise ValueError("无效模型响应")
+        if data["message"] is not None:
+            AssistantMessage.model_validate(data["message"])
+            if data["finish_reason"] not in {"stop", "tool_calls"}:
+                raise ValueError("无效模型响应")
+    if event.type == "steer.queued" and (
+        set(data) != {"queue_id", "content"} or not isinstance(data.get("queue_id"), str)
+        or not data["queue_id"] or not isinstance(data.get("content"), str)
+    ):
+        raise ValueError("无效排队消息")
+    if event.type == "steer.applied" and (
+        set(data) != {"queue_id", "message_id"} or not isinstance(data.get("queue_id"), str)
+        or not data["queue_id"] or not isinstance(data.get("message_id"), str) or not data["message_id"]
+    ):
+        raise ValueError("无效已应用消息")
     if event.type in {"tool.started", "tool.completed"}:
         keys = ("tool_call_id", "name", "arguments")
         if event.type == "tool.completed":
@@ -155,6 +174,50 @@ def _validate_event(event: ExecutionEvent, confirmations: dict[tuple[str, int, s
         if key not in confirmations or confirmations[key]:
             raise ValueError("确认请求无效")
         confirmations[key] = True
+
+
+def _validate_steering(records: list[Record]) -> None:
+    queued: dict[tuple[str, str], tuple[str, int]] = {}
+    seen: set[tuple[str, str]] = set()
+    applied_messages: set[str] = set()
+    last_applied_index: dict[str, int] = {}
+    messages: dict[str, tuple[MessageRecord, int]] = {}
+    for index, record in enumerate(records):
+        if isinstance(record, MessageRecord):
+            messages[record.id] = (record, index)
+            if record.queue_id is not None:
+                key = (record.run_id, record.queue_id)
+                if (key not in queued or record.message.role != "user"
+                        or record.message.content != queued[key][0]):
+                    raise ValueError("排队消息关联无效")
+        if not isinstance(record, EventRecord):
+            continue
+        event = record.event
+        if event.type == "steer.queued":
+            key = (event.run_id, event.data["queue_id"])
+            if key in seen:
+                raise ValueError("排队消息重复")
+            seen.add(key)
+            queued[key] = (event.data["content"], index)
+        if event.type == "steer.applied":
+            key = (event.run_id, event.data["queue_id"])
+            entry = messages.get(event.data["message_id"])
+            if key not in queued or entry is None:
+                raise ValueError("排队消息关联无效")
+            if key != next(queued_key for queued_key in queued if queued_key[0] == event.run_id):
+                raise ValueError("排队消息顺序无效")
+            message, message_index = entry
+            if message_index <= last_applied_index.get(event.run_id, -1):
+                raise ValueError("排队消息顺序无效")
+            content, queue_index = queued[key]
+            if (message.id in applied_messages or message.run_id != event.run_id
+                    or message.queue_id != event.data["queue_id"]
+                    or message.message.role != "user" or message.message.content != content
+                    or message_index <= queue_index):
+                raise ValueError("排队消息关联无效")
+            applied_messages.add(message.id)
+            last_applied_index[event.run_id] = message_index
+            del queued[key]
 
 
 def _validate_tool_results(records: list[Record]) -> None:
@@ -224,8 +287,16 @@ class Session:
             raise ValueError("无效会话路径")
         self.lock = FileLock(str(self.root / ".locks" / f"{self.id}.lock"))
         self.stream_lock = FileLock(str(self.root / ".locks" / f"{self.id}.stream.lock"))
+        self.tool_lock = FileLock(str(self.root / ".locks" / f"{self.id}.tool.lock"))
+        self.run_lock = FileLock(str(self.root / ".locks" / f"{self.id}.run.lock"), thread_local=False)
+        with _LIVE_RUNS_LOCK:
+            if str(self.path) not in _LIVE_LOCKS:
+                _LIVE_LOCKS[str(self.path)] = RLock()
+            self.live_lock = _LIVE_LOCKS[str(self.path)]
 
     def _read(self) -> list[Record]:
+        if str(self.path) in _WRITE_FAILURES:
+            raise OSError("会话写入状态不确定")
         data = self.path.read_bytes()
         if not data or not data.endswith(b"\n"):
             raise ValueError("会话记录残缺")
@@ -262,6 +333,7 @@ class Session:
                     raise ValueError("会话已有运行")
                 _validate_event(event, confirmations)
                 runs[event.run_id] = (event.seq, event.type in _TERMINAL)
+        _validate_steering(records)
         _validate_tool_results(records)
         _todo_state(records)
         return records
@@ -270,15 +342,28 @@ class Session:
         with self.lock:
             return self._read()
 
-    def _append(self, record: Record) -> None:
-        if any(existing.id == record.id for existing in self._read()):
+    def _append(self, record: Record, *, ids: set[str] | None = None) -> None:
+        if str(self.path) in _WRITE_FAILURES:
+            raise OSError("会话写入状态不确定")
+        if ids is None:
+            ids = {existing.id for existing in self._read()}
+        if record.id in ids:
             raise ValueError("记录 ID 重复")
         value = record.model_dump(mode="json")
+        if isinstance(record, MessageRecord) and record.queue_id is None:
+            del value["queue_id"]
         self.guard.check(value)
-        with self.path.open("ab") as file:
-            file.write((json.dumps(value, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8"))
-            file.flush()
-            os.fsync(file.fileno())
+        file = self.path.open("ab")
+        committed = False
+        try:
+            with file:
+                file.write((json.dumps(value, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8"))
+                file.flush()
+                os.fsync(file.fileno())
+            committed = True
+        finally:
+            if not committed:
+                _WRITE_FAILURES.add(str(self.path))
 
     def set_title(self, title: str) -> SessionInfoRecord:
         self.guard.check(title)
@@ -288,8 +373,12 @@ class Session:
             self._append(record)
             return record
 
-    def append_message(self, message: AgentMessage, run_id: str | None) -> MessageRecord:
+    def append_message(self, message: AgentMessage, run_id: str | None, *, queue_id: str | None = None) -> MessageRecord:
         self.guard.check(message)
+        if isinstance(message, AssistantMessage):
+            for block in message.content:
+                if isinstance(block, ToolCallContent):
+                    self.guard.check(TypeAdapter(JsonValue).validate_json(block.arguments))
         with self.lock:
             records = self._read()
             if run_id is None:
@@ -300,7 +389,8 @@ class Session:
                 events = [r.event for r in records if isinstance(r, EventRecord) and r.event.run_id == run_id]
                 if not events or events[-1].type in _TERMINAL:
                     raise ValueError("消息所属运行无效")
-            record = MessageRecord(id=uuid4().hex, timestamp=_now(), run_id=run_id, message=message)
+            record = MessageRecord(id=uuid4().hex, timestamp=_now(), run_id=run_id, message=message, queue_id=queue_id)
+            _validate_steering([*records, record])
             _validate_tool_results([*records, record])
             self._append(record)
             return record
@@ -309,6 +399,8 @@ class Session:
         self.guard.check(data)
         if event_type in {"model.delta", "model.response"}:
             raise ValueError("模型流事件须经过跨片段密钥检查")
+        if event_type in {"tool.started", "tool.completed"} and isinstance(data.get("arguments"), str):
+            self.guard.check(TypeAdapter(JsonValue).validate_json(data["arguments"]))
         if event_type == "tool.completed" and data.get("name") == "todo":
             raise ValueError("待办事件须通过待办接口提交")
         with self.lock:
@@ -339,6 +431,7 @@ class Session:
                 _validate_event(record.event, confirmations)
         _validate_event(event, confirmations)
         record = EventRecord(id=uuid4().hex, timestamp=now, event=event)
+        _validate_steering([*records, record])
         _validate_tool_results([*records, record])
         _todo_state([*records, record])
         self._append(record)
@@ -347,6 +440,10 @@ class Session:
     def record_model_stream(self, run_id: str, turn_index: int, chunks: Iterable[ChatCompletionChunk]) -> Iterator[ExecutionEvent]:
         if type(turn_index) is not int or turn_index < 1:
             raise ValueError("无效 Turn 序号")
+        def fingerprint() -> tuple[int, int, int, int]:
+            stat = self.path.stat()
+            return stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_ino
+
         with self.stream_lock:
             with self.lock:
                 records = self._read()
@@ -356,76 +453,103 @@ class Session:
                 ) or any(event.type in {"model.delta", "model.response"} and event.data.get("turn_index") == turn_index
                          for event in events):
                     raise ValueError("模型请求状态无效")
+                ids = {record.id for record in records}
+                seq = events[-1].seq
+                current = fingerprint()
             for normalized in normalized_stream(chunks, self.guard.secrets):
                 with self.lock:
-                    records = self._read()
+                    if fingerprint() != current:
+                        records = self._read()
+                        events = [r.event for r in records if isinstance(r, EventRecord) and r.event.run_id == run_id]
+                        if not events or events[-1].type in _TERMINAL:
+                            raise ValueError("运行已经结束")
+                        ids = {record.id for record in records}
+                        seq = events[-1].seq
+                    now = _now()
                     data = {"turn_index": turn_index, **normalized["data"]}
-                    event = self._append_event(records, run_id, normalized["type"], data)
+                    event = ExecutionEvent(run_id=run_id, seq=seq + 1, time=now, type=normalized["type"], data=data)
+                    _validate_event(event, {})
+                    record = EventRecord(id=uuid4().hex, timestamp=now, event=event)
+                    self._append(record, ids=ids)
+                    ids.add(record.id)
+                    seq = event.seq
+                    current = fingerprint()
                 yield event
 
     def execute_tool(self, registry: ToolRegistry, run_id: str, turn_index: int, tool_call_id: str,
-                     name: str, arguments: str) -> str:
+                     name: str, arguments: str, *, start: Callable[[], bool] | None = None) -> str | None:
         _id(run_id)
         if type(turn_index) is not int or turn_index < 1 or not isinstance(tool_call_id, str) or not tool_call_id:
             raise ValueError("无效工具调用")
         if name == "todo":
-            return self.execute_todo(run_id, turn_index, tool_call_id, arguments)
+            return self.execute_todo(run_id, turn_index, tool_call_id, arguments, start=start)
         self.guard.check({"name": name, "arguments": arguments})
-        with self.lock:
-            records = self._read()
-            events = [r.event for r in records if isinstance(r, EventRecord) and r.event.run_id == run_id]
-            if not events or events[-1].type in _TERMINAL:
-                raise ValueError("运行已经结束")
-            matches = lambda event: (event.data.get("turn_index") == turn_index
-                                     and event.data.get("tool_call_id") == tool_call_id)
-            if not any(event.type == "tool.started" and matches(event) and event.data.get("name") == name
-                       and event.data.get("arguments") == arguments for event in events):
-                raise ValueError("工具尚未启动")
-            if any(event.type == "tool.completed" and matches(event) for event in events):
-                raise ValueError("工具调用已经完成")
-            result = registry.execute(name, arguments)
+        with self.tool_lock:
+            with self.lock:
+                records = self._read()
+                events = [r.event for r in records if isinstance(r, EventRecord) and r.event.run_id == run_id]
+                if not events or events[-1].type in _TERMINAL:
+                    raise ValueError("运行已经结束")
+                matches = lambda event: (event.data.get("turn_index") == turn_index
+                                         and event.data.get("tool_call_id") == tool_call_id)
+                if not any(event.type == "tool.started" and matches(event) and event.data.get("name") == name
+                           and event.data.get("arguments") == arguments for event in events):
+                    raise ValueError("工具尚未启动")
+                if any(event.type == "tool.completed" and matches(event) for event in events):
+                    raise ValueError("工具调用已经完成")
+            result = registry.execute(name, arguments, secrets=self.guard.secrets, start=start)
+            if result is None:
+                return None
             self.guard.check(result)
-            self._append_event(records, run_id, "tool.completed", {
-                "turn_index": turn_index, "tool_call_id": tool_call_id, "name": name,
-                "arguments": arguments, "result": result,
-            })
+            with self.lock:
+                self._append_event(self._read(), run_id, "tool.completed", {
+                    "turn_index": turn_index, "tool_call_id": tool_call_id, "name": name,
+                    "arguments": arguments, "result": result,
+                })
             return result
 
     def todo_snapshot(self) -> list[dict]:
         return _todo_state(self.read())[0]
 
-    def execute_todo(self, run_id: str, turn_index: int, tool_call_id: str, arguments: str) -> str:
+    def execute_todo(self, run_id: str, turn_index: int, tool_call_id: str, arguments: str,
+                     *, start: Callable[[], bool] | None = None) -> str | None:
         _id(run_id)
         if type(turn_index) is not int or turn_index < 1 or not isinstance(tool_call_id, str) or not tool_call_id:
             raise ValueError("无效工具调用")
         self.guard.check(arguments)
+        self.guard.check(TypeAdapter(JsonValue).validate_json(arguments))
         command = TodoCommand.model_validate_json(arguments)
-        with self.lock:
-            records = self._read()
-            events = [r.event for r in records if isinstance(r, EventRecord) and r.event.run_id == run_id]
-            if not events or events[-1].type in _TERMINAL:
-                raise ValueError("运行已经结束")
-            matches = lambda event: (event.data.get("turn_index") == turn_index
-                                     and event.data.get("tool_call_id") == tool_call_id)
-            if not any(event.type == "tool.started" and matches(event) and event.data.get("name") == "todo"
-                       and event.data.get("arguments") == arguments for event in events):
-                raise ValueError("待办工具尚未启动")
-            if any(event.type == "tool.completed" and matches(event) for event in events):
-                raise ValueError("工具调用已经完成")
-            items, next_id = _todo_state(records)
-            if command.action == "delete":
-                requests = [event for event in events if event.type == "tool.confirmation_requested" and matches(event)]
-                choices = [event for event in events if event.type == "tool.confirmation_resolved" and matches(event)]
-                item = next((item for item in items if item["id"] == command.id), None)
-                if (len(requests) != 1 or len(choices) != 1 or choices[0].data["decision"] != "approved"
-                        or item is None or requests[0].data["task"] != {"id": item["id"], "title": item["title"]}):
-                    raise ValueError("待办删除尚未确认")
-            result = TodoList.restore(items, next_id).execute(command)
+        self.guard.check(command)
+        with self.tool_lock:
+            with self.lock:
+                records = self._read()
+                events = [r.event for r in records if isinstance(r, EventRecord) and r.event.run_id == run_id]
+                if not events or events[-1].type in _TERMINAL:
+                    raise ValueError("运行已经结束")
+                matches = lambda event: (event.data.get("turn_index") == turn_index
+                                         and event.data.get("tool_call_id") == tool_call_id)
+                if not any(event.type == "tool.started" and matches(event) and event.data.get("name") == "todo"
+                           and event.data.get("arguments") == arguments for event in events):
+                    raise ValueError("待办工具尚未启动")
+                if any(event.type == "tool.completed" and matches(event) for event in events):
+                    raise ValueError("工具调用已经完成")
+                items, next_id = _todo_state(records)
+                if command.action == "delete":
+                    requests = [event for event in events if event.type == "tool.confirmation_requested" and matches(event)]
+                    choices = [event for event in events if event.type == "tool.confirmation_resolved" and matches(event)]
+                    item = next((item for item in items if item["id"] == command.id), None)
+                    if (len(requests) != 1 or len(choices) != 1 or choices[0].data["decision"] != "approved"
+                            or item is None or requests[0].data["task"] != {"id": item["id"], "title": item["title"]}):
+                        raise ValueError("待办删除尚未确认")
+            result = TodoList.restore(items, next_id).execute(command, start=start)
+            if result is None:
+                return None
             self.guard.check(result)
-            self._append_event(records, run_id, "tool.completed", {
-                "turn_index": turn_index, "tool_call_id": tool_call_id, "name": "todo",
-                "arguments": arguments, "result": result,
-            })
+            with self.lock:
+                self._append_event(self._read(), run_id, "tool.completed", {
+                    "turn_index": turn_index, "tool_call_id": tool_call_id, "name": "todo",
+                    "arguments": arguments, "result": result,
+                })
             return result
 
     def trace(self, run_id: str) -> list[ExecutionEvent]:
@@ -433,7 +557,13 @@ class Session:
         return [r.event for r in self.read() if isinstance(r, EventRecord) and r.event.run_id == run_id]
 
     def recover(self) -> list[ExecutionEvent]:
-        with self.lock:
+        with _LIVE_RUNS_LOCK:
+            if any(path == str(self.path) for path, _ in _LIVE_RUNS):
+                return []
+        with self.run_lock.acquire(blocking=False), self.lock, self.live_lock:
+            with _LIVE_RUNS_LOCK:
+                if any(path == str(self.path) for path, _ in _LIVE_RUNS):
+                    return []
             records = self._read()
             last = {r.event.run_id: r.event for r in records if isinstance(r, EventRecord)}
             return [self._append_event(records, run_id, "run.finished", {"status": "interrupted"})
@@ -443,8 +573,11 @@ class Session:
         _id(active_run_id)
         records = self.read()
         completed = {r.event.run_id for r in records if isinstance(r, EventRecord) and r.event.type == "run.completed"}
+        applied = {r.event.data["message_id"] for r in records
+                   if isinstance(r, EventRecord) and r.event.type == "steer.applied"}
         messages = [r.message for r in records if isinstance(r, MessageRecord)
-                    and (r.run_id is None or r.run_id == active_run_id or r.run_id in completed)]
+                    and (r.run_id is None or r.run_id == active_run_id or r.run_id in completed)
+                    and (r.queue_id is None or r.id in applied)]
         self.guard.check(messages)
         to_openai_messages(messages)
         return messages

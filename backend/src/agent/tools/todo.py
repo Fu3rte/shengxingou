@@ -1,6 +1,7 @@
 """内存任务清单：单实例内 ID 递增，读写加锁并返回快照，进程退出即丢失。"""
 
 import json
+from collections.abc import Callable
 from threading import Lock
 from typing import Literal
 
@@ -70,7 +71,9 @@ class TodoList:
                 raise ValueError(f"任务不存在: {item_id}")
             return dict(item)
 
-    def execute(self, command: TodoCommand) -> str:
+    def execute(self, command: TodoCommand, *, start: Callable[[], bool] | None = None) -> str | None:
+        if start is not None and not start():
+            return None
         match command.action:
             case "add":
                 if command.title is None:

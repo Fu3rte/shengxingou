@@ -18,7 +18,7 @@ export function ModelConfig({ open, running, onOpenChange, onSaved }: ModelConfi
   const [model, setModel] = useState("")
   const [baseUrl, setBaseUrl] = useState("")
   const [apiKey, setApiKey] = useState("")
-  const [mask, setMask] = useState("")
+  const [apiKeySet, setApiKeySet] = useState(false)
   const [pending, setPending] = useState(false)
   const [error, setError] = useState("")
 
@@ -36,7 +36,7 @@ export function ModelConfig({ open, running, onOpenChange, onSaved }: ModelConfi
         setModel(config.model ?? "")
         setBaseUrl(config.base_url ?? "")
         setApiKey("")
-        setMask(config.api_key ?? "")
+        setApiKeySet(config.api_key_set ?? false)
         setError("")
       } catch (cause) {
         if (!controller.signal.aborted) setError(cause instanceof Error ? cause.message : "读取配置失败")
@@ -84,8 +84,8 @@ export function ModelConfig({ open, running, onOpenChange, onSaved }: ModelConfi
             <Input id="config-base-url" value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} disabled={pending} autoComplete="off" spellCheck={false} />
           </div>
           <div className="grid gap-2">
-            <Label htmlFor="config-api-key">API Key</Label>
-            <Input id="config-api-key" type="password" value={apiKey} placeholder={mask} onChange={(event) => setApiKey(event.target.value)} disabled={pending} autoComplete="off" />
+            <Label htmlFor="config-api-key">API Key{apiKeySet ? "（已设置）" : ""}</Label>
+            <Input id="config-api-key" type="password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} disabled={pending} autoComplete="off" />
           </div>
           {error && <p role="alert" className="text-sm text-destructive">{error}</p>}
         </div>
