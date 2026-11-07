@@ -239,9 +239,7 @@ def _validate_tool_results(records: list[Record]) -> None:
                 raise ValueError("运行缺少工具结果消息")
 
 
-def _todo_state(records: list[Record]) -> tuple[list[dict], int]:
-    items: dict[int, dict] = {}
-    next_id = 1
+def _validate_todo_results(records: list[Record]) -> None:
     for record in records:
         if not isinstance(record, EventRecord) or record.event.type != "tool.completed":
             continue
@@ -250,31 +248,20 @@ def _todo_state(records: list[Record]) -> tuple[list[dict], int]:
             continue
         command = TodoCommand.model_validate_json(data["arguments"])
         result = json.loads(data["result"])
-        if command.action == "list":
-            if not isinstance(result, dict) or set(result) != {"items"} or not isinstance(result["items"], list):
-                raise ValueError("待办记录无效")
-            listed = [TodoItem.model_validate(item).model_dump() for item in result["items"]]
-            if listed != list(items.values()):
-                raise ValueError("待办记录无效")
-            continue
-        key = "deleted" if command.action == "delete" else "item"
+        key = "items" if command.action == "list" else "deleted" if command.action == "delete" else "item"
         if not isinstance(result, dict) or set(result) != {key}:
             raise ValueError("待办记录无效")
+        if command.action == "list":
+            if not isinstance(result[key], list):
+                raise ValueError("待办记录无效")
+            for item in result[key]:
+                TodoItem.model_validate(item)
+            continue
         item = TodoItem.model_validate(result[key]).model_dump()
-        if command.action == "add":
-            if command.title is None or item != {"id": next_id, "title": command.title.strip(), "status": "pending"}:
-                raise ValueError("待办记录无效")
-            items[next_id] = item
-            next_id += 1
-        elif command.action == "set_status":
-            if command.id not in items or command.status is None or item != {**items[command.id], "status": command.status}:
-                raise ValueError("待办记录无效")
-            items[command.id] = item
-        elif command.action == "delete":
-            if command.id not in items or item != items[command.id]:
-                raise ValueError("待办记录无效")
-            del items[command.id]
-    return list(items.values()), next_id
+        if (command.action == "add" and (command.title is None or item["title"] != command.title.strip() or item["status"] != "pending")
+                or command.action == "set_status" and (item["id"] != command.id or item["status"] != command.status)
+                or command.action == "delete" and item["id"] != command.id):
+            raise ValueError("待办记录无效")
 
 
 class Session:
@@ -288,6 +275,8 @@ class Session:
         self.lock = FileLock(str(self.root / ".locks" / f"{self.id}.lock"))
         self.stream_lock = FileLock(str(self.root / ".locks" / f"{self.id}.stream.lock"))
         self.tool_lock = FileLock(str(self.root / ".locks" / f"{self.id}.tool.lock"))
+        self.todo_lock = FileLock(str(self.root / ".locks" / "todo.lock"))
+        self.todo_path = self.root / ".todo" / "todo.jsonl"
         self.run_lock = FileLock(str(self.root / ".locks" / f"{self.id}.run.lock"), thread_local=False)
         with _LIVE_RUNS_LOCK:
             if str(self.path) not in _LIVE_LOCKS:
@@ -335,7 +324,7 @@ class Session:
                 runs[event.run_id] = (event.seq, event.type in _TERMINAL)
         _validate_steering(records)
         _validate_tool_results(records)
-        _todo_state(records)
+        _validate_todo_results(records)
         return records
 
     def read(self) -> list[Record]:
@@ -433,7 +422,7 @@ class Session:
         record = EventRecord(id=uuid4().hex, timestamp=now, event=event)
         _validate_steering([*records, record])
         _validate_tool_results([*records, record])
-        _todo_state([*records, record])
+        _validate_todo_results([*records, record])
         self._append(record)
         return event
 
@@ -508,8 +497,36 @@ class Session:
                 })
             return result
 
+    def _read_todo(self) -> tuple[list[dict], int]:
+        if not self.todo_path.exists():
+            return [], 1
+        data = self.todo_path.read_bytes()
+        if not data or not data.endswith(b"\n"):
+            raise ValueError("待办文件残缺")
+        lines = data.splitlines()
+        header = json.loads(lines[0])
+        if not isinstance(header, dict) or set(header) != {"next_id"}:
+            raise ValueError("待办文件无效")
+        items = [TodoItem.model_validate_json(line).model_dump() for line in lines[1:]]
+        store = TodoList.restore(items, header["next_id"])
+        return store.snapshot(), header["next_id"]
+
+    def _write_todo(self, items: list[dict], next_id: int) -> None:
+        self.todo_path.parent.mkdir(exist_ok=True)
+        temporary = self.todo_path.parent / f"{uuid4().hex}.tmp"
+        try:
+            with temporary.open("xb") as file:
+                for value in ({"next_id": next_id}, *items):
+                    file.write((json.dumps(value, ensure_ascii=False) + "\n").encode("utf-8"))
+                file.flush()
+                os.fsync(file.fileno())
+            os.replace(temporary, self.todo_path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
     def todo_snapshot(self) -> list[dict]:
-        return _todo_state(self.read())[0]
+        with self.todo_lock:
+            return self._read_todo()[0]
 
     def execute_todo(self, run_id: str, turn_index: int, tool_call_id: str, arguments: str,
                      *, start: Callable[[], bool] | None = None) -> str | None:
@@ -520,7 +537,7 @@ class Session:
         self.guard.check(TypeAdapter(JsonValue).validate_json(arguments))
         command = TodoCommand.model_validate_json(arguments)
         self.guard.check(command)
-        with self.tool_lock:
+        with self.todo_lock, self.tool_lock:
             with self.lock:
                 records = self._read()
                 events = [r.event for r in records if isinstance(r, EventRecord) and r.event.run_id == run_id]
@@ -533,7 +550,7 @@ class Session:
                     raise ValueError("待办工具尚未启动")
                 if any(event.type == "tool.completed" and matches(event) for event in events):
                     raise ValueError("工具调用已经完成")
-                items, next_id = _todo_state(records)
+                items, next_id = self._read_todo()
                 if command.action == "delete":
                     requests = [event for event in events if event.type == "tool.confirmation_requested" and matches(event)]
                     choices = [event for event in events if event.type == "tool.confirmation_resolved" and matches(event)]
@@ -541,12 +558,19 @@ class Session:
                     if (len(requests) != 1 or len(choices) != 1 or choices[0].data["decision"] != "approved"
                             or item is None or requests[0].data["task"] != {"id": item["id"], "title": item["title"]}):
                         raise ValueError("待办删除尚未确认")
-            result = TodoList.restore(items, next_id).execute(command, start=start)
+            store = TodoList.restore(items, next_id)
+            result = store.execute(command, start=start)
             if result is None:
                 return None
             self.guard.check(result)
             with self.lock:
-                self._append_event(self._read(), run_id, "tool.completed", {
+                records = self._read()
+                events = [r.event for r in records if isinstance(r, EventRecord) and r.event.run_id == run_id]
+                if not events or events[-1].type in _TERMINAL:
+                    raise ValueError("运行已经结束")
+                if command.action != "list" or not self.todo_path.exists():
+                    self._write_todo(store.snapshot(), next_id + (command.action == "add"))
+                self._append_event(records, run_id, "tool.completed", {
                     "turn_index": turn_index, "tool_call_id": tool_call_id, "name": "todo",
                     "arguments": arguments, "result": result,
                 })

@@ -1,6 +1,6 @@
 'use client';
 
-import { memo, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { memo, useLayoutEffect, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import {
@@ -50,14 +50,11 @@ const timeFormat = new Intl.DateTimeFormat('zh-CN', {
 export type TimelineView = {
     expanded: Map<string, boolean>;
     scroll: Map<string, number>;
-    focused: Map<string, number>;
 };
 type Props = {
     session: string;
     order: string[];
     events: Record<string, AgentEvent[]>;
-    selectedRun: string;
-    focus: number;
     view: TimelineView;
 };
 
@@ -66,32 +63,17 @@ function Disclosure({
     title,
     children,
     view,
-    initiallyOpen = false,
-    focus = 0,
     className = '',
 }: {
     id: string;
     title: ReactNode;
     children: ReactNode;
     view: TimelineView;
-    initiallyOpen?: boolean;
-    focus?: number;
     className?: string;
 }) {
-    const [open, setOpen] = useState(
-        () => view.expanded.get(id) ?? initiallyOpen
-    );
-    const ref = useRef<HTMLDetailsElement>(null);
-    useEffect(() => {
-        if (!focus || view.focused.get(id) === focus) return;
-        view.focused.set(id, focus);
-        view.expanded.set(id, true);
-        setOpen(true);
-        ref.current?.scrollIntoView({ block: 'nearest' });
-    }, [focus, id, view]);
+    const [open, setOpen] = useState(() => view.expanded.get(id) ?? false);
     return (
         <details
-            ref={ref}
             open={open}
             onToggle={(event) => {
                 const next = event.currentTarget.open;
@@ -267,15 +249,11 @@ const Run = memo(function Run({
     session,
     run,
     events,
-    selected,
-    focus,
     view,
 }: {
     session: string;
     run: string;
     events: AgentEvent[];
-    selected: boolean;
-    focus: number;
     view: TimelineView;
 }) {
     const cache = useRef<TimelineData>(createTimeline());
@@ -297,8 +275,6 @@ const Run = memo(function Run({
     return (
         <Disclosure
             id={`${run}:run`}
-            initiallyOpen={selected}
-            focus={selected ? focus : 0}
             view={view}
             className='rounded-xl border bg-card p-3'
             title={
@@ -352,8 +328,6 @@ export function Timeline({
     session,
     order,
     events,
-    selectedRun,
-    focus,
     view,
 }: Props) {
     const scrollRef = useRef<HTMLDivElement>(null);
@@ -382,8 +356,6 @@ export function Timeline({
                             session={session}
                             run={run}
                             events={events[run]}
-                            selected={selectedRun === run}
-                            focus={focus}
                             view={view}
                         />
                     ))}

@@ -40,17 +40,14 @@ export function Chat() {
     const [configOpen, setConfigOpen] = useState(false);
     const [model, setModel] = useState('');
     const [generation, setGeneration] = useState(0);
-    const [selectedRun, setSelectedRun] = useState('');
     const [timelineOpen, setTimelineOpen] = useState(false);
     const [rightOpen, setRightOpen] = useState(true);
     const [leftWidth, setLeftWidth] = useState(256);
     const [rightWidth, setRightWidth] = useState(320);
-    const [focusRun, setFocusRun] = useState(0);
     const [wide, setWide] = useState(false);
     const timelineView = useRef({
         expanded: new Map<string, boolean>(),
         scroll: new Map<string, number>(),
-        focused: new Map<string, number>(),
     });
     const followChat = useRef(true);
     const initialized = useRef(false);
@@ -73,11 +70,8 @@ export function Chat() {
         timelineView.current = {
             expanded: new Map(),
             scroll: new Map(),
-            focused: new Map(),
         };
-        setFocusRun(0);
         followChat.current = true;
-        setSelectedRun('');
         setTimelineOpen(false);
         sessionStorage.setItem('agent-session', id);
         setEvents({});
@@ -167,10 +161,7 @@ export function Chat() {
                         .map((record) => record.event!.run_id)
                 ),
             ];
-            if (!cancelled) {
-                setOrder(ids);
-                setSelectedRun((current) => current || ids.at(-1) || '');
-            }
+            if (!cancelled) setOrder(ids);
             await Promise.all(
                 ids.map(async (id) => {
                     const path = `/api/sessions/${session}/runs/${id}`;
@@ -264,14 +255,10 @@ export function Chat() {
     async function send() {
         if (!session || !content.trim() || pending) return;
         const sentSession = session;
-        const result = await post(`/api/sessions/${sentSession}/messages`, {
+        await post(`/api/sessions/${sentSession}/messages`, {
             content,
         });
         if (currentSession.current === sentSession) {
-            if (result.run_id !== running && !order.includes(result.run_id)) {
-                setSelectedRun(result.run_id);
-                setFocusRun((value) => value + 1);
-            }
             setContent('');
             setGeneration((value) => value + 1);
         }
@@ -438,8 +425,6 @@ export function Chat() {
                         session={session}
                         order={order}
                         events={events}
-                        selectedRun={selectedRun}
-                        focus={focusRun}
                         view={timelineView.current}
                     />
                 )}
@@ -472,8 +457,6 @@ export function Chat() {
                             session={session}
                             order={order}
                             events={events}
-                            selectedRun={selectedRun}
-                            focus={focusRun}
                             view={timelineView.current}
                         />
                     )}

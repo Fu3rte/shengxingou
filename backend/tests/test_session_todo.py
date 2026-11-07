@@ -1,7 +1,9 @@
 import json
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Barrier
 
 from src.agent.session import SessionManager
 
@@ -39,7 +41,49 @@ class SessionTodoTests(unittest.TestCase):
         self.session.append_event("r2", "run.started", {"input": "继续"})
         self.assertEqual(self.call("r2", 1, "c4", {"action": "add", "title": "三"})["item"]["id"], 3)
         other = self.manager.create()
-        self.assertEqual(other.todo_snapshot(), [])
+        self.assertEqual(other.todo_snapshot(), [
+            {"id": 1, "title": "一", "status": "pending"},
+            {"id": 3, "title": "三", "status": "pending"},
+        ])
+        lines = (Path(self.directory.name) / ".todo" / "todo.jsonl").read_text(encoding="utf-8").splitlines()
+        self.assertEqual([json.loads(line) for line in lines], [{"next_id": 4}, *other.todo_snapshot()])
+
+    def test_cross_session_updates_and_concurrent_adds(self):
+        sessions = [self.manager.create() for _ in range(8)]
+        barrier = Barrier(len(sessions))
+
+        def add(index):
+            session = sessions[index]
+            session.append_event("run", "run.started", {"input": "任务"})
+            arguments = json.dumps({"action": "add", "title": f"任务{index}"}, ensure_ascii=False)
+            session.append_event("run", "tool.started", {"turn_index": 1, "tool_call_id": "c1", "name": "todo", "arguments": arguments})
+            barrier.wait()
+            return json.loads(session.execute_todo("run", 1, "c1", arguments))["item"]["id"]
+
+        with ThreadPoolExecutor(max_workers=len(sessions)) as pool:
+            ids = list(pool.map(add, range(len(sessions))))
+        self.assertEqual(sorted(ids), list(range(1, 9)))
+        self.assertEqual(len(self.session.todo_snapshot()), 8)
+        changed = self.call("r1", 1, "status", {"action": "set_status", "id": 1, "status": "completed"})["item"]
+        self.assertEqual(self.manager.open(sessions[0].id).todo_snapshot()[0], changed)
+        arguments = json.dumps({"action": "delete", "id": 1})
+        self.session.append_event("r1", "tool.started", {"turn_index": 2, "tool_call_id": "delete", "name": "todo", "arguments": arguments})
+        self.session.append_event("r1", "tool.confirmation_requested", {"turn_index": 2, "tool_call_id": "delete", "name": "todo", "action": "delete", "task": {"id": 1, "title": changed["title"]}})
+        self.session.append_event("r1", "tool.confirmation_resolved", {"turn_index": 2, "tool_call_id": "delete", "decision": "approved"})
+        self.session.execute_todo("r1", 2, "delete", arguments)
+        self.assertEqual(len(self.manager.open(sessions[0].id).todo_snapshot()), 7)
+
+    def test_finished_run_does_not_modify_shared_file(self):
+        arguments = '{"action":"add","title":"任务"}'
+        self.session.append_event("r1", "tool.started", {"turn_index": 1, "tool_call_id": "c1", "name": "todo", "arguments": arguments})
+
+        def finish():
+            self.session.append_event("r1", "run.finished", {"status": "stopped"})
+            return True
+
+        with self.assertRaisesRegex(ValueError, "运行已经结束"):
+            self.session.execute_todo("r1", 1, "c1", arguments, start=finish)
+        self.assertEqual(self.session.todo_snapshot(), [])
 
     def test_escaped_secret_does_not_modify_todo(self):
         session = SessionManager(Path(self.directory.name), secrets=("secret",)).create()
