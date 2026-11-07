@@ -174,6 +174,13 @@ def get_session(session_id: str):
         return {'id': session.id, 'records': [record.model_dump(mode='json') for record in session.read()]}
 
 
+@app.delete('/api/sessions/{session_id}')
+def delete_session(session_id: str):
+    with lock:
+        session_or_404(session_id).path.unlink()
+    return {'ok': True}
+
+
 @app.post('/api/sessions/{session_id}/messages')
 def append_message(session_id: str, data: MessageInput):
     with lock:

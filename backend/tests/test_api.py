@@ -21,6 +21,24 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(self.client.get('/api/sessions/invalid/runs/run/stream?after=-1').status_code, 422)
         self.assertEqual(self.client.get('/api/sessions/invalid/runs/run/stream', headers={'Last-Event-ID': 'x'}).status_code, 422)
 
+    def test_delete_session(self):
+        sessions = manager()
+        first, second = sessions.create(), sessions.create()
+        for session in (first, second):
+            self.addCleanup(session.path.unlink, missing_ok=True)
+            for suffix in ('.lock', '.stream.lock', '.tool.lock', '.run.lock'):
+                self.addCleanup((SESSIONS / '.locks' / f'{session.id}{suffix}').unlink, missing_ok=True)
+        path = f'/api/sessions/{first.id}'
+        headers = {'origin': 'http://127.0.0.1:3000'}
+        self.assertEqual(self.client.delete(path).status_code, 403)
+        self.assertEqual(self.client.delete(path, headers=headers).status_code, 200)
+        self.assertFalse(first.path.exists())
+        self.assertEqual(self.client.get(path).status_code, 404)
+        self.assertEqual(self.client.delete(path, headers=headers).status_code, 404)
+        self.assertEqual(self.client.delete('/api/sessions/invalid!', headers=headers).status_code, 404)
+        self.assertNotIn(first.id, [item['id'] for item in self.client.get('/api/sessions').json()])
+        self.assertEqual(self.client.get(f'/api/sessions/{second.id}').status_code, 200)
+
     def test_persisted_sse_replay_and_session_isolation(self):
         sessions = manager()
         first, second = sessions.create(), sessions.create()

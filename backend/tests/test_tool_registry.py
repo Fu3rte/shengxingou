@@ -57,8 +57,8 @@ class ToolRegistryTests(unittest.TestCase):
             registry.execute("calculate", '{"left":"bad","operator":"+","right":"0"}')
 
     def test_weather_and_search_execution_and_validation(self):
-        self.assertEqual(json.loads(registry.execute("weather", '{"location":"示例城"}')),
-                         {"location": "示例城", "condition": "晴", "temperature_c": 24,
+        self.assertEqual(json.loads(registry.execute("weather", '{"location":"广州"}')),
+                         {"location": "广州", "condition": "晴", "temperature_c": 24,
                           "source": "custom", "is_live": False})
         result = json.loads(registry.execute("search", '{"query":"退货","limit":1}'))
         self.assertEqual(result["source"], "mock")

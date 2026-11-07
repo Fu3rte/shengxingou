@@ -1,6 +1,6 @@
 # 省心购
 
-项目目前处于搭建阶段，目标是实现包含前后端界面的最小 Agent Loop。
+基于 Python Agent Loop 的本地对话应用，支持会话管理、流式展示、工具调用和待办事项。
 
 ## 技术栈
 
@@ -10,12 +10,9 @@
 
 ## 项目目录
 
+- `backend/src/api.py`：本机 HTTP 和 SSE 接口。
 - `backend/src/ai/`：模型和供应商适配。
-- `backend/src/agent/`：Agent Loop 和工具。
-- `backend/src/domain/`：业务领域规则。
-- `backend/src/application/`：业务应用服务。
-- `backend/src/infrastructure/`：业务基础设施。
-- `backend/src/interfaces/`：业务接口。
+- `backend/src/agent/`：Agent Loop、会话持久化和工具。
 - `backend/tests/`：后端测试。
 - `frontend/src/app/`：Next.js 路由和布局。
 - `frontend/src/features/`：按功能组织的前端代码。
@@ -34,9 +31,17 @@
 npm run setup
 ```
 
-将 `backend/.env.example` 复制为 `backend/.env`，填写 `OPENAI_API_KEY`、`OPENAI_MODEL` 和需要时使用的 `OPENAI_BASE_URL`。
+在项目根目录启动前后端：
 
-在项目根目录运行 `npm run dev`，然后访问 `http://127.0.0.1:3000`。模型和 API Key 也可在页面配置，保存在本机 `backend/.data/config.json`。会话及执行记录保存在 `backend/.data/sessions/`。
+```bash
+npm run dev
+```
+
+访问 `http://127.0.0.1:3000`，在页面配置模型、API Key 和可选的 OpenAI 兼容接口地址。也可将 `backend/.env.example` 复制为 `backend/.env`，填写 `OPENAI_MODEL`、`OPENAI_API_KEY` 和可选的 `OPENAI_BASE_URL`。页面保存的非空配置优先生效。
+
+使用 `Ctrl+C` 停止前后端。更新服务入口后，需要停止旧开发进程并重新启动。
+
+配置保存在本机 `backend/.data/config.json`，API Key 以明文保存；会话和执行记录保存在 `backend/.data/sessions/`。`backend/.data/` 和 `backend/.env` 已加入 Git 忽略规则，请保护本机文件。
 
 ### 后端
 
@@ -57,7 +62,9 @@ uv run python -m unittest discover -s tests
 uv run uvicorn src.api:app --host 127.0.0.1 --port 8765 --no-access-log
 ```
 
-`backend/src/agent/agent_loop.py` 提供 Agent Loop 接口，会话和执行记录保存在 Session JSONL 文件中。
+`backend/src/agent/agent_loop.py` 提供 Agent Loop 接口，`backend/src/api.py` 提供会话、消息、停止、删除确认和执行事件接口。执行事件通过 SSE 推送，断线后支持按事件游标恢复。
+
+每个会话的数据相互隔离，同一会话的待办在多次运行之间共享。删除待办需要确认；停止请求在当前模型响应或工具执行结束后生效。计算器执行实际计算；天气和搜索使用本地样例数据。
 
 ### 前端
 

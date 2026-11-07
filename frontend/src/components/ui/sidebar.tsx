@@ -152,6 +152,7 @@ function Sidebar({
   side = "left",
   variant = "sidebar",
   collapsible = "offcanvas",
+  mobileWidth,
   className,
   children,
   dir,
@@ -160,6 +161,7 @@ function Sidebar({
   side?: "left" | "right"
   variant?: "sidebar" | "floating" | "inset"
   collapsible?: "offcanvas" | "icon" | "none"
+  mobileWidth?: number
 }) {
   const { isMobile, state, openMobile, setOpenMobile } = useSidebar()
 
@@ -189,7 +191,8 @@ function Sidebar({
           className="w-(--sidebar-width) bg-sidebar p-0 text-sidebar-foreground [&>button]:hidden"
           style={
             {
-              "--sidebar-width": SIDEBAR_WIDTH_MOBILE,
+              "--sidebar-width": mobileWidth ? `${mobileWidth}px` : SIDEBAR_WIDTH_MOBILE,
+              maxWidth: "calc(100vw - 48px)",
             } as React.CSSProperties
           }
           side={side}

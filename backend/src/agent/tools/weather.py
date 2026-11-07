@@ -13,9 +13,9 @@ class WeatherRecord(TypedDict):
 
 
 WEATHER_RECORDS: dict[str, WeatherRecord] = {
-    "示例城": {"condition": "晴", "temperature_c": 24},
-    "测试市": {"condition": "多云", "temperature_c": 19},
-    "样例县": {"condition": "小雨", "temperature_c": 16},
+    "广州": {"condition": "晴", "temperature_c": 24},
+    "东莞": {"condition": "多云", "temperature_c": 19},
+    "深圳": {"condition": "小雨", "temperature_c": 16},
 }
 
 

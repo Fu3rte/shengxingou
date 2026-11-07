@@ -13,7 +13,7 @@ class AgentToolChainTests(unittest.TestCase):
         self.assertEqual([tool['function']['name'] for tool in registry.declarations()],
                          ['calculate', 'weather', 'search', 'todo'])
         self.assertEqual(json.loads(registry.execute('calculate', ' {"left":"7", "operator":"+", "right":"3"} ')), {'result': '10'})
-        self.assertFalse(json.loads(registry.execute('weather', '{"location":"示例城"}'))['is_live'])
+        self.assertFalse(json.loads(registry.execute('weather', '{"location":"广州"}'))['is_live'])
         self.assertEqual(json.loads(registry.execute('search', '{"query":"python"}'))['source'], 'mock')
         self.assertEqual(json.loads(registry.execute('todo', '{"action":"list"}')), {'items': []})
 
