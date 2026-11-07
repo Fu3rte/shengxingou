@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 
 from openai.types.chat import ChatCompletion, ChatCompletionChunk
@@ -13,7 +14,12 @@ from src.agent.types import (
     ToolResultMessage,
     UserMessage,
 )
-from src.ai.models.openai import ModelResponse, convert_stream, from_openai_response, to_openai_messages
+from src.ai.models.openai import ModelResponse, async_convert_stream, from_openai_response, to_openai_messages
+from tests.stream_helpers import async_chunks, sync_stream
+
+
+def convert_stream(chunks):
+    return sync_stream(async_convert_stream(async_chunks(chunks)))
 
 
 def chunk(choices, **extra):
@@ -132,6 +138,16 @@ class MessageConversionTests(unittest.TestCase):
             ToolCallContent(id="2", name="g", arguments="invalid-json")])
         with self.assertRaises(StopIteration):
             next(stream)
+
+        async def convert():
+            async def source():
+                for item in chunks:
+                    yield item
+            return [item async for item in async_convert_stream(source())]
+
+        converted = asyncio.run(convert())
+        self.assertEqual(converted[:-1], [item.model_dump(mode="json", exclude_unset=True) for item in chunks])
+        self.assertEqual(converted[-1], final)
 
     def test_stream_refusal_split_and_immediate_delivery_on_error(self):
         chunks = [chunk([choice({"role": "assistant", "content": "hello ", "refusal": "can"})]),

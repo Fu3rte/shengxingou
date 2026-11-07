@@ -15,9 +15,11 @@
 
 ## 服务调用接口
 
-`backend/src/agent/agent_loop.py` 提供 `AgentLoop(session, client, model)`，其中 `client` 为使用固定 API key 的 `AsyncOpenAI`。客户端仅用于 AgentLoop 的模型事件循环，使用固定凭据和标准 HTTP transport；不支持动态密钥、HTTP event hooks、URL 身份信息、默认查询参数、Cookie 或代理认证。Loop 为客户端禁用 Cookie 的接收与发送；调用期间不得更改凭据。`append_message(content)` 返回所属 `run_id`；`trace(run_id)` 读取事件快照；`events(run_id, after)` 按序交付已持久化事件；`abort(run_id)` 提交停止信号；`confirm(run_id, turn_index, tool_call_id, decision)` 提交删除选择；`wait(run_id, timeout)` 等待执行并传播错误。`close(timeout)` 等待当前操作退出，未结束的 Run 在重新打开时恢复为 `interrupted`。调用方在所有 Run 退出后使用 `close_model_client(client)` 关闭客户端。
+`backend/src/agent/runtime.py` 提供模块级 async 接口。`await create_agent(session, client, model)` 创建只保存数据的 `Agent`，其中 `client` 为使用固定 API key 的 `AsyncOpenAI`。客户端使用固定凭据和标准 HTTP transport；不支持动态密钥、HTTP event hooks、URL 身份信息、默认查询参数、Cookie 或代理认证。创建 Agent 时禁用 Cookie 的接收与发送；调用期间不得更改凭据。
 
-这些同步接口不得在模型事件循环线程中调用。其他进程持有同一 Session 的运行锁时，创建或恢复运行直接报锁冲突。接口已通过 HTTP、SSE 接入前端。
+`await append_message(agent, content)` 返回所属 `run_id`；`await trace(agent, run_id)` 读取事件快照；`events(agent, run_id, after)` 异步交付已持久化事件；`await abort(agent, run_id)` 提交停止信号；`await confirm(agent, run_id, turn_index, tool_call_id, decision)` 提交删除选择；`await wait(agent, run_id, timeout)` 等待执行并传播错误。`await close(agent, timeout)` 等待当前操作退出，未结束的 Run 在重新打开时恢复为 `interrupted`。调用方在所有 Run 退出后使用 `await client.close()` 关闭客户端。
+
+模型流在调用方的事件循环中读取，文件和同步工具操作在线程中执行。其他进程持有同一 Session 的运行锁时，创建或恢复运行直接报锁冲突。接口已通过 HTTP、SSE 接入前端。
 
 ## 消息追加
 

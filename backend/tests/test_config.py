@@ -9,7 +9,7 @@ from fastapi import HTTPException
 from src import api as server
 
 
-class ConfigTests(unittest.TestCase):
+class ConfigTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         directory = Path(__file__).resolve().parents[2] / ".tool-tmp"
         directory.mkdir(exist_ok=True)
@@ -47,21 +47,21 @@ class ConfigTests(unittest.TestCase):
         self.assertTrue(public["api_key_set"])
         self.assertNotIn("abcdefghijk", public["api_key"])
 
-    def test_put_config_persists_and_keeps_existing_key(self):
+    async def test_put_config_persists_and_keeps_existing_key(self):
         self.save_config({"model": "old", "base_url": "", "api_key": "sk-keep-000011112222"})
-        result = server.put_config(server.ConfigInput(model="new-model", base_url="https://new.example/v1", api_key=""))
+        result = await server.put_config(server.ConfigInput(model="new-model", base_url="https://new.example/v1", api_key=""))
         self.assertEqual(result["model"], "new-model")
         self.assertTrue(result["api_key_set"])
         self.assertEqual(server.read_config()["api_key"], "sk-keep-000011112222")
 
-    def test_put_config_rejects_invalid_base_url(self):
+    async def test_put_config_rejects_invalid_base_url(self):
         with self.assertRaises(HTTPException) as raised:
-            server.put_config(server.ConfigInput(model="m", base_url="ftp://x", api_key=""))
+            await server.put_config(server.ConfigInput(model="m", base_url="ftp://x", api_key=""))
         self.assertEqual(raised.exception.status_code, 422)
 
-    def test_put_config_rejects_blank_model(self):
+    async def test_put_config_rejects_blank_model(self):
         with self.assertRaises(HTTPException) as raised:
-            server.put_config(server.ConfigInput(model="  ", base_url="", api_key=""))
+            await server.put_config(server.ConfigInput(model="  ", base_url="", api_key=""))
         self.assertEqual(raised.exception.status_code, 422)
 
 

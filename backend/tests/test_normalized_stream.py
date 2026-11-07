@@ -2,7 +2,12 @@ import unittest
 
 from openai.types.chat import ChatCompletionChunk
 
-from src.ai.models.normalized import normalized_stream
+from src.ai.models.normalized import async_normalized_stream
+from tests.stream_helpers import async_chunks, sync_stream
+
+
+def normalized_stream(chunks, secrets):
+    return sync_stream(async_normalized_stream(async_chunks(chunks), secrets))
 
 
 def chunk(delta, finish_reason=None, **extra):
@@ -245,6 +250,37 @@ class NormalizedStreamTests(unittest.TestCase):
         self.assertIsNone(next(events)["data"]["message"])
         with self.assertRaisesRegex(ValueError, "密钥"):
             next(events)
+
+
+class AsyncNormalizedStreamTests(unittest.IsolatedAsyncioTestCase):
+    async def test_async_stream_matches_sync_and_checks_split_secret(self):
+        chunks = [chunk({"role": "assistant", "content": "hello "}),
+                  chunk({"content": "world"}), chunk({}, "stop")]
+
+        async def source(items):
+            for item in items:
+                yield item
+
+        events = [event async for event in async_normalized_stream(source(chunks), ["secret"])]
+        self.assertEqual([event["data"]["fragments"] for event in events[:-1]],
+                         [{"text": "hello "}, {"text": "world"}])
+        self.assertEqual(events[-1]["data"]["message"]["content"][0]["text"], "hello world")
+
+        chunks = [chunk({"role": "assistant", "content": "safe "}),
+                  chunk({"content": "sec"}), chunk({"content": "ret"}), chunk({}, "stop")]
+        events = async_normalized_stream(source(chunks), ["secret"])
+        self.assertEqual((await anext(events))["data"]["fragments"], {"text": "safe "})
+        self.assertIsNone((await anext(events))["data"]["message"])
+        with self.assertRaisesRegex(ValueError, "密钥"):
+            await anext(events)
+
+        chunks = [chunk({"role": "assistant", "content": "a", "refusal": "x"}), chunk({}, "length")]
+        events = async_normalized_stream(source(chunks), ["secret"])
+        self.assertEqual((await anext(events))["data"]["fragments"], {"text": "a"})
+        self.assertEqual((await anext(events))["data"]["fragments"], {"text": "x"})
+        self.assertEqual((await anext(events))["data"]["finish_reason"], "length")
+        with self.assertRaises(ValueError):
+            await anext(events)
 
 
 if __name__ == "__main__":

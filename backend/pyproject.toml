@@ -10,3 +10,6 @@ dependencies = [
     "python-dotenv>=1.2.4",
     "uvicorn[standard]>=0.54.0",
 ]
+
+[tool.ruff]
+target-version = "py314"

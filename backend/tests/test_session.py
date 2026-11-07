@@ -1,17 +1,28 @@
+import asyncio
 import json
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from threading import Barrier
+from threading import Barrier, Event
+from types import SimpleNamespace
+from unittest.mock import patch
 
-from src.agent.session import EventRecord, SessionManager
+from src.agent.session import SessionManager, run_sync
+from src.agent.session_records import EventRecord
+from src.agent.session_stream import record_model_stream_async
 from src.agent.tools.registry import registry
 from src.agent.tools.search import search
 from src.agent.types import AssistantMessage, SystemMessage, TextContent, ToolCallContent, ToolResultMessage, UserMessage
 from tests.test_normalized_stream import chunk
+from tests.stream_helpers import async_chunks, sync_stream
+
+
+def record_model_stream(session, run_id, turn_index, chunks):
+    return sync_stream(record_model_stream_async(session, run_id, turn_index, async_chunks(chunks)))
 
 
 class SessionTests(unittest.TestCase):
@@ -52,6 +63,27 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(reopened.recover(), [])
         self.assertEqual(reopened.trace("r1")[-1].type, "run.completed")
 
+    def test_append_event_reuses_validated_records_and_rejects_duplicate_id(self):
+        session = self.manager.create()
+        with patch.object(session, "_read", wraps=session._read) as read:
+            session.append_event("run", "run.started", {"input": "x"})
+            self.assertEqual(read.call_count, 1)
+        existing_id = session.read()[-1].id
+        before = session.path.read_bytes()
+        with patch("src.agent.session.uuid4", return_value=SimpleNamespace(hex=existing_id)):
+            with self.assertRaisesRegex(ValueError, "ID 重复"):
+                session.append_event("run", "run.finished", {"status": "stopped"})
+        self.assertEqual(session.path.read_bytes(), before)
+
+    def test_model_writer_rejects_non_model_records(self):
+        session = self.manager.create()
+        event = session.append_event("run", "run.started", {"input": "x"})
+        before = session.path.read_bytes()
+        record = EventRecord(id="invalid", timestamp=event.time, event=event)
+        with self.assertRaisesRegex(ValueError, "模型流记录类型无效"):
+            session.append_model_record(record, ids=set())
+        self.assertEqual(session.path.read_bytes(), before)
+
     def test_uncommitted_tool_result_rejected(self):
         session = self.manager.create()
         session.append_event("r1", "run.started", {"input": "x"})
@@ -81,6 +113,41 @@ class SessionTests(unittest.TestCase):
         for session in (first, second):
             self.assertEqual(sorted(seq for session_id, seq in results if session_id == session.id), list(range(2, 12)))
             self.assertEqual([event.seq for event in session.trace("run")], list(range(1, 12)))
+
+    def test_cross_process_run_lock_and_recovery(self):
+        session = self.manager.create()
+        session.append_event("run", "run.started", {"input": "x"})
+        code = ("import sys; from pathlib import Path; from src.agent.session import SessionManager; "
+                "SessionManager(Path(sys.argv[1]), secrets=()).open(sys.argv[2]).recover()")
+        with session.run_lock:
+            result = subprocess.run([sys.executable, "-c", code, str(self.manager.root), session.id],
+                                    capture_output=True, text=True, timeout=15)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Timeout", result.stderr)
+        self.assertEqual(session.recover()[0].data["status"], "interrupted")
+
+    def test_cancelled_sync_operation_finishes_once(self):
+        path = Path(self.directory.name) / "operation.txt"
+        started, release = Event(), Event()
+
+        def write():
+            started.set()
+            release.wait()
+            with path.open("a", encoding="utf-8") as file:
+                file.write("done")
+
+        async def cancel_twice():
+            task = asyncio.create_task(run_sync(write))
+            await asyncio.to_thread(started.wait)
+            task.cancel()
+            await asyncio.sleep(0)
+            task.cancel()
+            release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(cancel_twice())
+        self.assertEqual(path.read_text(encoding="utf-8"), "done")
 
     def test_steering_links_queued_and_appended_message(self):
         session = self.manager.create()
@@ -242,7 +309,7 @@ class SessionTests(unittest.TestCase):
         session.append_event("r1", "model.request", {"turn_index": 1, "model": "example", "messages": [], "tools": []})
         chunks = [chunk({"role": "assistant", "content": "safe ", "vendor": "ignored"}),
                   chunk({"content": "secret-"}), chunk({"content": "key"}), chunk({}, "stop")]
-        stream = session.record_model_stream("r1", 1, chunks)
+        stream = record_model_stream(session, "r1", 1, chunks)
         first = next(stream)
         self.assertEqual(first.data["fragments"], {"text": "safe "})
         self.assertEqual(self.manager.open(session.id).trace("r1")[-1], first)
@@ -258,7 +325,7 @@ class SessionTests(unittest.TestCase):
         session = self.manager.create()
         session.append_event("r1", "run.started", {"input": "x"})
         session.append_event("r1", "model.request", {"turn_index": 1, "model": "example", "messages": [], "tools": []})
-        stream = session.record_model_stream("r1", 1, [chunk({"role": "assistant", "content": "a"}),
+        stream = record_model_stream(session, "r1", 1, [chunk({"role": "assistant", "content": "a"}),
                                                        chunk({"content": "b"}), chunk({}, "stop")])
         first = next(stream)
         other = self.manager.open(session.id)
@@ -269,11 +336,30 @@ class SessionTests(unittest.TestCase):
         self.assertEqual([event.seq for event in (first, queued, *remaining)], [3, 4, 5, 6])
         self.assertEqual(events[-1].data["message"]["content"][0]["text"], "ab")
 
+        async def check_async_stream():
+            session = self.manager.create()
+            session.append_event("r1", "run.started", {"input": "x"})
+            session.append_event("r1", "model.request", {"turn_index": 1, "model": "example", "messages": [], "tools": []})
+
+            async def chunks():
+                for item in (chunk({"role": "assistant", "content": "a"}), chunk({"content": "b"}), chunk({}, "stop")):
+                    yield item
+
+            stream = record_model_stream_async(session, "r1", 1, chunks())
+            first = await anext(stream)
+            other = self.manager.open(session.id)
+            queued = await asyncio.to_thread(other.append_event, "r1", "steer.queued", {"queue_id": "q1", "content": "next"})
+            remaining = [event async for event in stream]
+            self.assertEqual([event.seq for event in (first, queued, *remaining)], [3, 4, 5, 6])
+            self.assertEqual(session.trace("r1")[-1].data["message"]["content"][0]["text"], "ab")
+
+        asyncio.run(check_async_stream())
+
     def test_model_stream_stops_after_concurrent_terminal_event(self):
         session = self.manager.create()
         session.append_event("r1", "run.started", {"input": "x"})
         session.append_event("r1", "model.request", {"turn_index": 1, "model": "example", "messages": [], "tools": []})
-        stream = session.record_model_stream("r1", 1, [chunk({"role": "assistant", "content": "a"}),
+        stream = record_model_stream(session, "r1", 1, [chunk({"role": "assistant", "content": "a"}),
                                                        chunk({"content": "b"}), chunk({}, "stop")])
         next(stream)
         self.manager.open(session.id).append_event("r1", "run.finished", {"status": "stopped"})
@@ -285,7 +371,7 @@ class SessionTests(unittest.TestCase):
         session = self.manager.create()
         session.append_event("r1", "run.started", {"input": "x"})
         session.append_event("r1", "model.request", {"turn_index": 1, "model": "example", "messages": [], "tools": []})
-        stream = session.record_model_stream("r1", 1, [chunk({"role": "assistant", "content": "a"}),
+        stream = record_model_stream(session, "r1", 1, [chunk({"role": "assistant", "content": "a"}),
                                                        chunk({"content": "b"}), chunk({}, "stop")])
         next(stream)
         with session.path.open("ab") as file:
@@ -300,7 +386,7 @@ class SessionTests(unittest.TestCase):
         chunks = [chunk({"role": "assistant", "tool_calls": [{"index": 0, "id": "call1", "type": "function",
                      "function": {"name": "search", "arguments": '{"query":"\\u0073ecret-key"}'}}]}),
                   chunk({}, "tool_calls")]
-        stream = session.record_model_stream("r1", 1, chunks)
+        stream = record_model_stream(session, "r1", 1, chunks)
         self.assertEqual(next(stream).data["fragments"], {"tool:0:id": "call1"})
         self.assertEqual(next(stream).data["fragments"], {"tool:0:name": "search"})
         self.assertIsNone(next(stream).data["message"])
@@ -315,7 +401,7 @@ class SessionTests(unittest.TestCase):
         chunks = [chunk({"role": "assistant", "tool_calls": [{"index": 0, "id": "call1", "type": "function",
                                                               "function": {"name": "calculate", "arguments": "{}"}}]}),
                   chunk({}, "tool_calls")]
-        events = list(session.record_model_stream("r1", 1, chunks))
+        events = list(record_model_stream(session, "r1", 1, chunks))
         self.assertEqual(events[-1].type, "model.response")
         self.assertEqual(events[-1].data["message"]["content"][0]["id"], "call1")
         self.assertEqual(session.trace("r1")[-1], events[-1])
@@ -324,7 +410,7 @@ class SessionTests(unittest.TestCase):
         session = self.manager.create()
         session.append_event("r1", "run.started", {"input": "x"})
         session.append_event("r1", "model.request", {"turn_index": 1, "model": "example", "messages": [], "tools": []})
-        stream = session.record_model_stream("r1", 1, [chunk({"role": "assistant", "content": "partial"}),
+        stream = record_model_stream(session, "r1", 1, [chunk({"role": "assistant", "content": "partial"}),
                                                        chunk({}, "length")])
         self.assertEqual(next(stream).data["fragments"], {"text": "partial"})
         response = next(stream)
@@ -339,7 +425,7 @@ class SessionTests(unittest.TestCase):
         session = self.manager.create()
         session.append_event("r1", "run.started", {"input": "x"})
         session.append_event("r1", "model.request", {"turn_index": 1, "model": "example", "messages": [], "tools": []})
-        stream = session.record_model_stream("r1", 1, [chunk({"role": "assistant", "refusal": "safe refusal", "vendor": "ignored"}),
+        stream = record_model_stream(session, "r1", 1, [chunk({"role": "assistant", "refusal": "safe refusal", "vendor": "ignored"}),
                                                        chunk({}, "length")])
         self.assertEqual(next(stream).data["fragments"], {"text": "safe refusal"})
         self.assertEqual(next(stream).data, {"turn_index": 1, "message": None, "finish_reason": "length", "usage": None})
@@ -355,7 +441,7 @@ class SessionTests(unittest.TestCase):
         session = self.manager.create()
         session.append_event("r1", "run.started", {"input": "x"})
         session.append_event("r1", "model.request", {"turn_index": 1, "model": "example", "messages": [], "tools": []})
-        stream = session.record_model_stream("r1", 1, [chunk({"role": "assistant", "refusal": "safe "}),
+        stream = record_model_stream(session, "r1", 1, [chunk({"role": "assistant", "refusal": "safe "}),
                                                        chunk({"refusal": "secret-"}), chunk({"refusal": "key"}),
                                                        chunk({}, "length")])
         self.assertEqual(next(stream).data["fragments"], {"text": "safe "})

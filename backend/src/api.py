@@ -2,9 +2,8 @@ import asyncio
 import json
 import os
 import re
-from contextlib import ExitStack, asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
-from threading import RLock
 from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
@@ -14,16 +13,17 @@ from openai import AsyncOpenAI
 from pydantic import BaseModel, Field
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from .agent.agent_loop import AgentLoop, close_model_client
-from .agent.session import SessionManager
+from .agent.runtime import Agent, InvalidConfirmation, abort, append_message, close, confirm, create_agent, events, is_active, protect
+from .agent.security import contains
+from .agent.session import SessionManager, run_sync
 from .agent.types import SystemMessage
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG = ROOT / '.data' / 'config.json'
 SESSIONS = ROOT / '.data' / 'sessions'
 load_dotenv(ROOT / '.env')
-lock = RLock()
-loops: dict[str, tuple[AgentLoop, AsyncOpenAI]] = {}
+lock = asyncio.Lock()
+loops: dict[str, tuple[Agent, AsyncOpenAI]] = {}
 TERMINAL = {'run.completed', 'run.finished'}
 
 
@@ -56,43 +56,54 @@ def session_or_404(session_id):
     return sessions.open(session_id)
 
 
-def get_loop(session_id):
-    session = session_or_404(session_id)
+async def _close_client(client):
+    await protect(client.close())
+
+
+async def get_loop(session_id):
+    return await protect(_get_loop(session_id))
+
+
+async def _get_loop(session_id):
+    session = await run_sync(session_or_404, session_id)
     if session_id not in loops:
-        settings = resolve_config()
+        settings = await run_sync(resolve_config)
         if not settings['model'] or not settings['api_key']:
             raise HTTPException(422, '请配置模型和 API Key')
-        client = AsyncOpenAI(api_key=settings['api_key'], base_url=settings['base_url'] or None, max_retries=0, timeout=60.0)
-        with ExitStack() as cleanup:
-            cleanup.callback(close_model_client, client)
-            loop = AgentLoop(session, client, settings['model'])
-            loops[session_id] = (loop, client)
+        client = await run_sync(AsyncOpenAI, api_key=settings['api_key'], base_url=settings['base_url'] or None, max_retries=0, timeout=60.0)
+        async with AsyncExitStack() as cleanup:
+            cleanup.push_async_callback(_close_client, client)
+            agent = await create_agent(session, client, settings['model'])
+            loops[session_id] = (agent, client)
             cleanup.pop_all()
     return loops[session_id][0]
 
 
-def close_loops():
-    with ExitStack() as cleanup:
-        for loop, client in loops.values():
-            cleanup.callback(close_model_client, client)
-            cleanup.callback(loop.close)
+async def close_loops():
+    async with AsyncExitStack() as cleanup:
+        for agent, client in loops.values():
+            cleanup.push_async_callback(_close_client, client)
+            cleanup.push_async_callback(close, agent)
         loops.clear()
 
 
 @asynccontextmanager
 async def lifespan(app):
-    await asyncio.to_thread(manager().recover)
+    await run_sync(lambda: manager().recover())
     try:
         yield
     finally:
-        def shutdown():
-            with lock:
-                close_loops()
-        await asyncio.to_thread(shutdown)
+        async with lock:
+            await close_loops()
 
 
 app = FastAPI(lifespan=lifespan)
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=['localhost', '127.0.0.1'])
+
+
+@app.exception_handler(InvalidConfirmation)
+async def invalid_confirmation(request: Request, error: InvalidConfirmation):
+    return JSONResponse({'detail': '确认请求无效'}, status_code=409)
 
 
 @app.middleware('http')
@@ -123,82 +134,102 @@ class ConfirmationInput(BaseModel):
 
 
 @app.get('/api/config')
-def get_config():
-    with lock:
-        return public_config()
+async def get_config():
+    async with lock:
+        return await run_sync(public_config)
+
+
+def _write_config(model, base_url, api_key):
+    CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    temp = CONFIG.with_suffix('.json.tmp')
+    with temp.open('w', encoding='utf-8') as file:
+        json.dump({'model': model, 'base_url': base_url, 'api_key': api_key}, file, ensure_ascii=False)
+        file.flush()
+        os.fsync(file.fileno())
+    os.replace(temp, CONFIG)
+    return public_config()
 
 
 @app.put('/api/config')
-def put_config(data: ConfigInput):
+async def put_config(data: ConfigInput):
     model, base_url, api_key = data.model.strip(), data.base_url.strip(), data.api_key.strip()
     url = urlsplit(base_url)
     if not model or (base_url and (url.scheme not in {'http', 'https'} or not url.hostname or url.username or url.password or url.query or url.fragment)):
         raise HTTPException(422, '模型或接口地址无效')
-    with lock:
-        if any(loop.state.active is not None for loop, _ in loops.values()):
+    async with lock:
+        if any(is_active(agent) for agent, _ in loops.values()):
             raise HTTPException(409, '执行中不能修改配置')
-        current = read_config()
+        current = await run_sync(read_config)
         key = api_key or current.get('api_key') or os.environ.get('OPENAI_API_KEY', '')
         env_key = os.environ.get('OPENAI_API_KEY', '')
         if any(secret and (secret in model or secret in base_url) for secret in (key, env_key)):
             raise HTTPException(422, '模型或接口地址包含密钥')
-        close_loops()
-        CONFIG.parent.mkdir(parents=True, exist_ok=True)
-        temp = CONFIG.with_suffix('.json.tmp')
-        with temp.open('w', encoding='utf-8') as file:
-            json.dump({'model': model, 'base_url': base_url, 'api_key': api_key or current.get('api_key', '')}, file, ensure_ascii=False)
-            file.flush()
-            os.fsync(file.fileno())
-        os.replace(temp, CONFIG)
-        return public_config()
+        await close_loops()
+        return await run_sync(_write_config, model, base_url, api_key or current.get('api_key', ''))
 
 
 @app.get('/api/sessions')
-def list_sessions():
-    with lock:
-        return [{'id': id, 'title': title} for id, title in manager().list()]
+async def list_sessions():
+    async with lock:
+        return await run_sync(lambda: [{'id': id, 'title': title} for id, title in manager().list()])
+
+
+def _create_session():
+    session = manager().create()
+    session.append_message(SystemMessage(content='你是助手。需要计算时使用计算器工具。'), None)
+    return {'id': session.id}
 
 
 @app.post('/api/sessions')
-def create_session():
-    with lock:
-        session = manager().create()
-        session.append_message(SystemMessage(content='你是助手。需要计算时使用计算器工具。'), None)
-        return {'id': session.id}
+async def create_session():
+    async with lock:
+        return await run_sync(_create_session)
+
+
+def _get_session(session_id):
+    session = session_or_404(session_id)
+    return {'id': session.id, 'records': [record.model_dump(mode='json') for record in session.read()]}
 
 
 @app.get('/api/sessions/{session_id}')
-def get_session(session_id: str):
-    with lock:
-        session = session_or_404(session_id)
-        return {'id': session.id, 'records': [record.model_dump(mode='json') for record in session.read()]}
+async def get_session(session_id: str):
+    async with lock:
+        return await run_sync(_get_session, session_id)
+
+
+def _delete_session(session_id):
+    session_or_404(session_id).path.unlink()
 
 
 @app.delete('/api/sessions/{session_id}')
-def delete_session(session_id: str):
-    with lock:
-        session_or_404(session_id).path.unlink()
+async def delete_session(session_id: str):
+    async with lock:
+        await run_sync(_delete_session, session_id)
     return {'ok': True}
 
 
 @app.post('/api/sessions/{session_id}/messages')
-def append_message(session_id: str, data: MessageInput):
-    with lock:
-        loop = get_loop(session_id)
-        if not data.content.strip() or loop.session.guard.contains(data.content):
+async def post_message(session_id: str, data: MessageInput):
+    async with lock:
+        agent = await get_loop(session_id)
+        if not data.content.strip() or contains(agent.session.guard, data.content):
             raise HTTPException(422, '消息无效或包含密钥')
-        return {'run_id': loop.append_message(data.content)}
+        return {'run_id': await append_message(agent, data.content)}
+
+
+def _trace(session_id, run_id):
+    if not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', run_id):
+        raise HTTPException(404, '运行不存在')
+    snapshot = session_or_404(session_id).trace(run_id)
+    if not snapshot:
+        raise HTTPException(404, '运行不存在')
+    return [event.model_dump(mode='json') for event in snapshot]
 
 
 @app.get('/api/sessions/{session_id}/runs/{run_id}/events')
-def trace(session_id: str, run_id: str):
-    with lock:
-        if not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', run_id):
-            raise HTTPException(404, '运行不存在')
-        events = session_or_404(session_id).trace(run_id)
-        if not events:
-            raise HTTPException(404, '运行不存在')
-        return [event.model_dump(mode='json') for event in events]
+async def trace_events(session_id: str, run_id: str):
+    async with lock:
+        return await run_sync(_trace, session_id, run_id)
 
 
 @app.get('/api/sessions/{session_id}/runs/{run_id}/stream')
@@ -209,75 +240,47 @@ async def stream(session_id: str, run_id: str, request: Request, after: str = '0
     cursor = int(cursor)
     if not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', run_id):
         raise HTTPException(404, '运行不存在')
-    session = await asyncio.to_thread(session_or_404, session_id)
-    size = session.path.stat().st_size
-    events = await asyncio.to_thread(session.trace, run_id)
-    if not events:
+    session = await run_sync(session_or_404, session_id)
+    snapshot = await run_sync(session.trace, run_id)
+    if not snapshot:
         raise HTTPException(404, '运行不存在')
-    if cursor > events[-1].seq:
+    if cursor > snapshot[-1].seq:
         raise HTTPException(422, '无效事件游标')
-
-    with lock:
-        loop = loops.get(session_id, (None, None))[0]
-    if events[-1].type not in TERMINAL and loop is None:
+    async with lock:
+        agent = loops.get(session_id, (None, None))[0]
+    if snapshot[-1].type not in TERMINAL and agent is None:
         raise RuntimeError('运行不在本进程中')
 
-    def next_events(previous_size):
-        with loop.state.condition:
-            changed = loop.state.condition.wait_for(
-                lambda: session.path.stat().st_size != previous_size or run_id in loop.state.finished,
-                timeout=1,
-            )
-            if not changed:
-                return None
-            next_size = session.path.stat().st_size
-            next_snapshot = session.trace(run_id)
-            if run_id in loop.state.finished and next_snapshot[-1].type not in TERMINAL:
-                raise RuntimeError('运行终态未持久化')
-            return next_size, next_snapshot
-
     async def generate():
-        nonlocal cursor, events, size
-        while True:
-            for event in events:
+        if snapshot[-1].type in TERMINAL:
+            for event in snapshot:
                 if event.seq > cursor:
-                    cursor = event.seq
                     yield f'id: {event.seq}\ndata: {event.model_dump_json()}\n\n'
-            if events[-1].type in TERMINAL:
-                return
-            update = await asyncio.to_thread(next_events, size)
-            if update is not None:
-                size, events = update
+            return
+        async for event in events(agent, run_id, cursor):
+            yield f'id: {event.seq}\ndata: {event.model_dump_json()}\n\n'
 
     return StreamingResponse(generate(), media_type='text/event-stream', headers={'Cache-Control': 'no-cache, no-transform', 'X-Accel-Buffering': 'no'})
 
 
 @app.post('/api/sessions/{session_id}/runs/{run_id}/stop')
-def stop(session_id: str, run_id: str):
-    with lock:
-        session_or_404(session_id)
-        loop = loops.get(session_id, (None, None))[0]
-        if loop is None:
+async def stop(session_id: str, run_id: str):
+    async with lock:
+        await run_sync(session_or_404, session_id)
+        agent = loops.get(session_id, (None, None))[0]
+        if agent is None or not is_active(agent, run_id):
             raise HTTPException(409, '运行不在执行中')
-        with loop.state.condition:
-            if loop.state.active != run_id:
-                raise HTTPException(409, '运行不在执行中')
-            if not loop.abort(run_id):
-                raise HTTPException(409, '运行已结束')
+        if not await abort(agent, run_id):
+            raise HTTPException(409, '运行已结束')
     return {'ok': True}
 
 
 @app.post('/api/sessions/{session_id}/runs/{run_id}/confirm')
-def confirm(session_id: str, run_id: str, data: ConfirmationInput):
-    with lock:
-        session_or_404(session_id)
-        loop = loops.get(session_id, (None, None))[0]
-        if loop is None:
+async def confirm_tool(session_id: str, run_id: str, data: ConfirmationInput):
+    async with lock:
+        await run_sync(session_or_404, session_id)
+        agent = loops.get(session_id, (None, None))[0]
+        if agent is None:
             raise HTTPException(409, '确认请求无效')
-        with loop.state.condition:
-            if (data.decision not in {'approved', 'rejected'} or loop.state.active != run_id
-                    or loop.state.stop or loop.state.shutdown or loop.state.decision is not None
-                    or loop.state.confirmation != (run_id, data.turn_index, data.tool_call_id)):
-                raise HTTPException(409, '确认请求无效')
-            loop.confirm(run_id, data.turn_index, data.tool_call_id, data.decision)
+        await confirm(agent, run_id, data.turn_index, data.tool_call_id, data.decision)
         return {'ok': True}

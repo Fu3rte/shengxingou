@@ -56,8 +56,8 @@ Chat Completions 分开表示文本和工具调用，跨字段的交错顺序无
 
 - `backend/src/agent/types.py` 已定义 `AgentMessage`、`TextContent` 和 `ToolCallContent`。
 - `backend/src/ai/models/openai.py` 的 `to_openai_messages` 与 `from_openai_response` 已实现消息双向转换。完成响应中的 `content`、`refusal` 和 `tool_calls` 可转换为内部内容块。
-- `convert_stream` 逐个交付 SDK 模型序列化后的 chunk，最终 `ModelResponse` 仍包含 SDK 响应对象。`backend/src/ai/models/normalized.py` 已提供归一化流事件，`Session.record_model_stream` 使用该接口记录事件。SDK 序列化结果不保证等于供应商的 HTTP 原始字节。
-- `backend/src/agent/agent_loop.py` 接收 SDK chunk 并通过 `Session.record_model_stream` 完成安全归一化。
+- `async_convert_stream` 逐个交付 SDK 模型序列化后的 chunk，最终 `ModelResponse` 仍包含 SDK 响应对象。`backend/src/ai/models/normalized.py` 提供异步归一化流事件。SDK 序列化结果不保证等于供应商的 HTTP 原始字节。
+- `backend/src/ai/models/openai_stream.py` 接收异步 SDK chunk，并通过 `backend/src/agent/session_stream.py` 的 `record_model_stream_async` 完成安全归一化和持久化。
 - `model.response` 记录完整消息或失败时可用的结束原因和用量。
 - `content` 和 `refusal` 片段交错时，归一化文本事件按最终消息的文本顺序输出。
 

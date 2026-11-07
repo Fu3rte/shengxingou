@@ -74,7 +74,9 @@ class SearchQuery(BaseModel):
     limit: int = Field(default=5, ge=1, le=10, description="返回结果条数，1 到 10")
 
 
-def search(request: SearchQuery, *, start: Callable[[], bool] | None = None) -> str | None:
+def search(
+    request: SearchQuery, *, start: Callable[[], bool] | None = None
+) -> str | None:
     if start is not None and not start():
         return None
     needle = request.query.strip().casefold()

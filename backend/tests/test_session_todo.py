@@ -6,6 +6,7 @@ from pathlib import Path
 from threading import Barrier
 
 from src.agent.session import SessionManager
+from src.agent.tools.registry import create_full_registry, execute, get
 
 
 class SessionTodoTests(unittest.TestCase):
@@ -72,6 +73,144 @@ class SessionTodoTests(unittest.TestCase):
         self.session.append_event("r1", "tool.confirmation_resolved", {"turn_index": 2, "tool_call_id": "delete", "decision": "approved"})
         self.session.execute_todo("r1", 2, "delete", arguments)
         self.assertEqual(len(self.manager.open(sessions[0].id).todo_snapshot()), 7)
+
+    def test_registry_executes_shared_todo(self):
+        other = self.manager.create()
+        other.append_event("other", "run.started", {"input": "查看"})
+        first_registry = create_full_registry(None, self.session.todo_snapshot, todo_execute=self.session.execute_todo)
+        other_registry = create_full_registry(None, other.todo_snapshot, todo_execute=other.execute_todo)
+        arguments = '{"action":"add","title":"共享"}'
+        self.session.append_event("r1", "tool.started", {"turn_index": 1, "tool_call_id": "add",
+                                                        "name": "todo", "arguments": arguments})
+        self.assertEqual(get(first_registry, "todo").execute, self.session.execute_todo)
+        with self.assertRaises(ValueError):
+            execute(first_registry, "todo", arguments)
+        result = self.session.execute_tool(first_registry, "r1", 1, "add", "todo", arguments)
+        self.assertEqual(json.loads(result)["item"], {"id": 1, "title": "共享", "status": "pending"})
+        arguments = '{"action":"list"}'
+        other.append_event("other", "tool.started", {"turn_index": 1, "tool_call_id": "list",
+                                                     "name": "todo", "arguments": arguments})
+        with self.assertRaisesRegex(ValueError, "会话不匹配"):
+            other.execute_tool(first_registry, "other", 1, "list", "todo", arguments)
+        result = other.execute_tool(other_registry, "other", 1, "list", "todo", arguments)
+        self.assertEqual(json.loads(result)["items"], self.session.todo_snapshot())
+        self.assertEqual(other.trace("other")[-1].type, "tool.completed")
+        arguments = '{"action":"delete","id":1}'
+        self.session.append_event("r1", "tool.started", {"turn_index": 2, "tool_call_id": "delete",
+                                                        "name": "todo", "arguments": arguments})
+        with self.assertRaisesRegex(ValueError, "尚未确认"):
+            self.session.execute_tool(first_registry, "r1", 2, "delete", "todo", arguments)
+        self.session.append_event("r1", "tool.confirmation_requested", {
+            "turn_index": 2, "tool_call_id": "delete", "name": "todo", "action": "delete",
+            "task": {"id": 1, "title": "共享"},
+        })
+        self.session.append_event("r1", "tool.confirmation_resolved", {
+            "turn_index": 2, "tool_call_id": "delete", "decision": "approved",
+        })
+        result = self.session.execute_tool(first_registry, "r1", 2, "delete", "todo", arguments)
+        self.assertEqual(json.loads(result)["deleted"]["id"], 1)
+        self.assertEqual(other.todo_snapshot(), [])
+
+    def test_delete_confirmation_rechecks_shared_state(self):
+        self.call("r1", 1, "add", {"action": "add", "title": "共享任务"})
+        arguments = json.dumps({"action": "delete", "id": 1})
+        request = {"turn_index": 2, "tool_call_id": "delete", "name": "todo", "action": "delete",
+                   "task": {"id": 1, "title": "共享任务"}}
+        self.session.append_event("r1", "tool.started", {"turn_index": 2, "tool_call_id": "delete",
+                                                         "name": "todo", "arguments": arguments})
+        self.session.append_event("r1", "tool.confirmation_requested", request)
+        self.session.append_event("r1", "tool.confirmation_resolved", {
+            "turn_index": 2, "tool_call_id": "delete", "decision": "approved",
+        })
+        other = self.manager.create()
+        other.append_event("other", "run.started", {"input": "删除"})
+        other.append_event("other", "tool.started", {"turn_index": 2, "tool_call_id": "delete",
+                                                       "name": "todo", "arguments": arguments})
+        other.append_event("other", "tool.confirmation_requested", request)
+        other.append_event("other", "tool.confirmation_resolved", {
+            "turn_index": 2, "tool_call_id": "delete", "decision": "approved",
+        })
+        other.execute_todo("other", 2, "delete", arguments)
+        with self.assertRaisesRegex(ValueError, "待办删除尚未确认"):
+            self.session.execute_todo("r1", 2, "delete", arguments)
+        self.assertEqual(self.session.todo_snapshot(), [])
+        self.assertNotIn("tool.completed", [event.type for event in self.session.trace("r1")
+                                             if event.data.get("tool_call_id") == "delete"])
+
+    def test_history_revalidates_todo_results_on_open(self):
+        self.call("r1", 1, "add", {"action": "add", "title": "任务"})
+        self.call("r1", 2, "list", {"action": "list"})
+        self.call("r1", 3, "status", {"action": "set_status", "id": 1, "status": "completed"})
+        arguments = '{"action":"delete","id":1}'
+        self.session.append_event("r1", "tool.started", {"turn_index": 4, "tool_call_id": "delete", "name": "todo", "arguments": arguments})
+        self.session.append_event("r1", "tool.confirmation_requested", {"turn_index": 4, "tool_call_id": "delete", "name": "todo", "action": "delete", "task": {"id": 1, "title": "任务"}})
+        self.session.append_event("r1", "tool.confirmation_resolved", {"turn_index": 4, "tool_call_id": "delete", "decision": "approved"})
+        self.session.execute_todo("r1", 4, "delete", arguments)
+        original = self.session.path.read_text(encoding="utf-8")
+        self.manager.open(self.session.id)
+        invalid = [
+            ("add", '{"item":{"id":1,"title":"其他","status":"pending"}}'),
+            ("add", "{"),
+            ("list", '{"items":{}}'),
+            ("list", '{"items":[{"id":0,"title":"任务","status":"pending"}]}'),
+            ("status", '{"item":{"id":1,"title":"任务","status":"pending"}}'),
+            ("delete", '{"deleted":{"id":2,"title":"任务","status":"completed"}}'),
+        ]
+        for call_id, result in invalid:
+            with self.subTest(call_id=call_id, result=result):
+                records = [json.loads(line) for line in original.splitlines()]
+                event = next(record["event"] for record in records if record["type"] == "event"
+                             and record["event"]["type"] == "tool.completed"
+                             and record["event"]["data"]["tool_call_id"] == call_id)
+                event["data"]["result"] = result
+                self.session.path.write_text("".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records), encoding="utf-8")
+                with self.assertRaises(ValueError):
+                    self.manager.open(self.session.id)
+        self.session.path.write_text(original, encoding="utf-8")
+        self.manager.open(self.session.id)
+
+    def test_shared_file_validation_rejects_corruption(self):
+        self.call("r1", 1, "add", {"action": "add", "title": "任务"})
+        path = self.session.todo_path
+        original = path.read_bytes()
+        for content in (b'', b'{"next_id":2}', b'{"next_id":true}\n',
+                        b'{"next_id":1}\n{"id":1,"title":"x","status":"pending"}\n',
+                        b'{"next_id":3}\n{"id":1,"title":"x","status":"pending"}\n'
+                        b'{"id":1,"title":"y","status":"pending"}\n'):
+            with self.subTest(content=content):
+                path.write_bytes(content)
+                with self.assertRaises(ValueError):
+                    self.manager.create().todo_snapshot()
+        path.write_bytes(original)
+        self.assertEqual(self.manager.create().todo_snapshot(), [{"id": 1, "title": "任务", "status": "pending"}])
+
+    def test_delete_confirmation_uses_current_status_after_other_session_update(self):
+        self.call("r1", 1, "add", {"action": "add", "title": "任务"})
+        arguments = '{"action":"delete","id":1}'
+        self.session.append_event("r1", "tool.started", {"turn_index": 2, "tool_call_id": "delete", "name": "todo", "arguments": arguments})
+        self.session.append_event("r1", "tool.confirmation_requested", {"turn_index": 2, "tool_call_id": "delete", "name": "todo", "action": "delete", "task": {"id": 1, "title": "任务"}})
+        self.session.append_event("r1", "tool.confirmation_resolved", {"turn_index": 2, "tool_call_id": "delete", "decision": "approved"})
+        other = self.manager.create()
+        other.append_event("other", "run.started", {"input": "修改"})
+        update = '{"action":"set_status","id":1,"status":"completed"}'
+        other.append_event("other", "tool.started", {"turn_index": 1, "tool_call_id": "status", "name": "todo", "arguments": update})
+        other.execute_todo("other", 1, "status", update)
+        result = json.loads(self.session.execute_todo("r1", 2, "delete", arguments))
+        self.assertEqual(result["deleted"], {"id": 1, "title": "任务", "status": "completed"})
+        self.assertEqual(other.todo_snapshot(), [])
+        self.assertEqual([event.type for event in self.session.trace("r1")][-3:],
+                         ["tool.confirmation_requested", "tool.confirmation_resolved", "tool.completed"])
+
+    def test_delete_confirmation_rejects_mismatched_title(self):
+        self.call("r1", 1, "add", {"action": "add", "title": "现有标题"})
+        arguments = '{"action":"delete","id":1}'
+        self.session.append_event("r1", "tool.started", {"turn_index": 2, "tool_call_id": "delete", "name": "todo", "arguments": arguments})
+        self.session.append_event("r1", "tool.confirmation_requested", {"turn_index": 2, "tool_call_id": "delete", "name": "todo", "action": "delete", "task": {"id": 1, "title": "旧标题"}})
+        self.session.append_event("r1", "tool.confirmation_resolved", {"turn_index": 2, "tool_call_id": "delete", "decision": "approved"})
+        with self.assertRaisesRegex(ValueError, "待办删除尚未确认"):
+            self.session.execute_todo("r1", 2, "delete", arguments)
+        self.assertEqual(self.manager.create().todo_snapshot(), [{"id": 1, "title": "现有标题", "status": "pending"}])
+        self.assertNotIn("tool.completed", [event.type for event in self.session.trace("r1") if event.data.get("tool_call_id") == "delete"])
 
     def test_finished_run_does_not_modify_shared_file(self):
         arguments = '{"action":"add","title":"任务"}'

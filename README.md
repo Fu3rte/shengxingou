@@ -62,9 +62,9 @@ uv run python -m unittest discover -s tests
 uv run uvicorn src.api:app --host 127.0.0.1 --port 8765 --no-access-log
 ```
 
-`backend/src/agent/agent_loop.py` 提供 Agent Loop 接口，`backend/src/api.py` 提供会话、消息、停止、删除确认和执行事件接口。执行事件通过 SSE 推送，断线后支持按事件游标恢复。
+`backend/src/agent/runtime.py` 提供 Agent 运行接口，`backend/src/agent/agent_loop.py` 实现循环，`backend/src/api.py` 提供会话、消息、停止、删除确认和执行事件接口。执行事件通过 SSE 推送，断线后支持按事件游标恢复。
 
-每个会话的数据相互隔离，同一会话的待办在多次运行之间共享。删除待办需要确认；停止请求在当前模型响应或工具执行结束后生效。计算器执行实际计算；天气和搜索使用本地样例数据。
+各会话的消息和运行记录相互隔离，所有会话共享同一个待办文件。删除待办需要确认；停止请求在当前模型响应或工具执行结束后生效。计算器执行实际计算；天气和搜索使用本地样例数据。
 
 ### 前端
 
