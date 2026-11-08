@@ -5,7 +5,10 @@ import type { ReactNode } from 'react';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import {
     appendTimeline,
+    cachedTokens,
+    cacheHitRate,
     createTimeline,
+    runCacheHitRate,
     terminal,
     tokenFields,
 } from '@/features/agent/timeline-data';
@@ -37,6 +40,8 @@ const tokenNames: Record<string, string> = {
 const format = (value: unknown) =>
     typeof value === 'string' ? value : JSON.stringify(value, null, 2);
 const durationText = (value: number) => `${(value / 1000).toFixed(2)} 秒`;
+const rateText = (value: number | undefined) =>
+    value === undefined ? '未知' : `${value.toFixed(2)}%`;
 const timeFormat = new Intl.DateTimeFormat('zh-CN', {
     year: 'numeric',
     month: '2-digit',
@@ -118,6 +123,7 @@ const Row = memo(function Row({
     const { event, duration } = row;
     const data = event.data;
     const id = `${event.run_id}:${event.seq}`;
+    const cached = cachedTokens(data.usage);
     const fields = Object.entries(data).filter(
         ([key]) =>
             !['turn_index', 'messages', 'tools', 'message', 'usage'].includes(
@@ -157,6 +163,15 @@ const Row = memo(function Row({
                             </div>
                         )
                 )}
+            {event.type === 'model.response' && (
+                <>
+                    <div>缓存命中输入 Token：{cached ?? '未知'}</div>
+                    <div>
+                        输入缓存命中率：
+                        {rateText(cacheHitRate(cached, data.usage?.prompt_tokens))}
+                    </div>
+                </>
+            )}
             {data.messages != null && (
                 <Details
                     id={`${id}:messages`}
@@ -235,6 +250,8 @@ const Turn = memo(function Turn({
                                     usage?.[field] ?? '缺失'
                                 }`
                         )}
+                    {response &&
+                        ` · 缓存命中输入 Token ${cachedTokens(usage) ?? '未知'} · 输入缓存命中率 ${rateText(cacheHitRate(cachedTokens(usage), usage?.prompt_tokens))}`}
                 </span>
             }
         >
@@ -302,6 +319,23 @@ const Run = memo(function Run({
                                 : ''}
                         </div>
                     ))}
+                {data.requestCount > 0 && (
+                    <>
+                        <div>
+                            缓存命中输入 Token：
+                            {data.usageCount.cached_tokens
+                                ? data.usage.cached_tokens
+                                : '未知'}
+                            {(data.usageCount.cached_tokens ?? 0) <
+                                data.requestCount || !finished
+                                ? '（汇总不完整）'
+                                : ''}
+                        </div>
+                        <div>
+                            输入缓存命中率：{rateText(runCacheHitRate(data, finished))}
+                        </div>
+                    </>
+                )}
             </div>
             {data.sections.map((section) =>
                 section.kind === 'event' ? (

@@ -3,7 +3,9 @@
 import { memo, useRef } from 'react';
 import Markdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import { LoaderCircle } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { Separator } from '@/components/ui/separator';
 import { terminal } from '@/features/agent/timeline-data';
 import type { AgentEvent } from '@/features/agent/timeline-data';
 
@@ -37,6 +39,8 @@ export const ChatRun = memo(function ChatRun({
     reasoning: new Map<number, string>(),
     results: new Map<string, AgentEvent>(),
     resolved: new Set<string>(),
+    compactRequest: undefined as number | undefined,
+    compactStatuses: new Map<number, string>(),
   });
   if (
     items.length < cache.current.count ||
@@ -51,11 +55,30 @@ export const ChatRun = memo(function ChatRun({
       reasoning: new Map(),
       results: new Map(),
       resolved: new Set(),
+      compactRequest: undefined,
+      compactStatuses: new Map(),
     };
   }
   const data = cache.current;
   for (let index = data.count; index < items.length; index++) {
     const event = items[index];
+    if (event.type === 'compact.request') {
+      data.compactRequest = event.seq;
+      data.compactStatuses.set(event.seq, '正在压缩中');
+    } else if (
+      data.compactRequest !== undefined &&
+      (event.type === 'compact.completed' || terminal(event))
+    ) {
+      data.compactStatuses.set(
+        data.compactRequest,
+        event.type === 'compact.completed'
+          ? '已完成压缩'
+          : event.type === 'run.finished'
+            ? statuses[event.data.status] || event.data.status
+            : '执行中断'
+      );
+      data.compactRequest = undefined;
+    }
     if (event.type === 'model.delta') {
       const turn = event.data.turn_index;
       if (event.data.fragments.text)
@@ -73,6 +96,7 @@ export const ChatRun = memo(function ChatRun({
         'model.request',
         'tool.started',
         'tool.confirmation_requested',
+        'compact.request',
         'run.finished',
       ].includes(event.type)
     )
@@ -85,6 +109,26 @@ export const ChatRun = memo(function ChatRun({
     <article className='space-y-4'>
       {data.visible.map((event) => {
         const item = event.data;
+        if (event.type === 'compact.request') {
+          const status = data.compactStatuses.get(event.seq);
+          return (
+            <div
+              key={event.seq}
+              role='status'
+              className='flex items-center gap-3 text-sm text-muted-foreground'
+            >
+              <Separator className='flex-1' />
+              {status === '正在压缩中' && (
+                <LoaderCircle
+                  aria-hidden='true'
+                  className='size-4 animate-spin motion-reduce:animate-none'
+                />
+              )}
+              <span className='whitespace-nowrap'>{status}</span>
+              <Separator className='flex-1' />
+            </div>
+          );
+        }
         if (
           event.type === 'run.started' ||
           event.type === 'steer.queued'

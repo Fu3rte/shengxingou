@@ -28,6 +28,31 @@ export const tokenFields = [
     'completion_tokens',
     'total_tokens',
 ] as const;
+export const cachedTokens = (usage: any): number | undefined => {
+    const value = usage?.prompt_tokens_details?.cached_tokens;
+    return typeof value === 'number' && Number.isFinite(value) && value >= 0
+        ? value
+        : undefined;
+};
+export const cacheHitRate = (
+    cached: unknown,
+    prompt: unknown
+): number | undefined =>
+    typeof cached === 'number' &&
+    Number.isFinite(cached) &&
+    cached >= 0 &&
+    typeof prompt === 'number' &&
+    Number.isFinite(prompt) &&
+    prompt > 0
+        ? (cached / prompt) * 100
+        : undefined;
+export const runCacheHitRate = (timeline: TimelineData, finished: boolean) =>
+    finished &&
+    timeline.requestCount > 0 &&
+    timeline.usageCount.cached_tokens === timeline.requestCount &&
+    timeline.usageCount.prompt_tokens === timeline.requestCount
+        ? cacheHitRate(timeline.usage.cached_tokens, timeline.usage.prompt_tokens)
+        : undefined;
 export const terminal = (event?: AgentEvent) =>
     !!event && ['run.completed', 'run.finished'].includes(event.type);
 const toolKey = (event: AgentEvent) =>
@@ -72,6 +97,13 @@ export function appendTimeline(timeline: TimelineData, events: AgentEvent[]) {
                     timeline.usageCount[field] =
                         (timeline.usageCount[field] ?? 0) + 1;
                 }
+            }
+            const cached = cachedTokens(event.data.usage);
+            if (cached !== undefined) {
+                timeline.usage.cached_tokens =
+                    (timeline.usage.cached_tokens ?? 0) + cached;
+                timeline.usageCount.cached_tokens =
+                    (timeline.usageCount.cached_tokens ?? 0) + 1;
             }
         }
         if (event.type === 'tool.started')
