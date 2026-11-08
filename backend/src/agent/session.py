@@ -11,8 +11,8 @@ from pydantic import JsonValue, TypeAdapter
 
 from .security import check, create_guard
 from .tools.registry import ToolRegistry, execute as execute_registered_tool
+from .tools import todo
 from .tools.todo import TodoCommand, validate_delete_confirmation
-from .tools.todo_store import SharedTodo
 from .types import (
     AgentMessage,
     AssistantMessage,
@@ -65,9 +65,8 @@ class Session:
             str(self.root / ".locks" / f"{self.id}.stream.lock")
         )
         self.tool_lock = FileLock(str(self.root / ".locks" / f"{self.id}.tool.lock"))
-        self.todo = SharedTodo(self.root)
-        self.todo_lock = self.todo.lock
-        self.todo_path = self.todo.path
+        self.todo_lock = FileLock(str(self.root / ".locks" / "todo.lock"))
+        self.todo_path = self.root / ".todo" / "todo.jsonl"
         self.run_lock = FileLock(
             str(self.root / ".locks" / f"{self.id}.run.lock"), thread_local=False
         )
@@ -315,7 +314,7 @@ class Session:
             return result
 
     def todo_snapshot(self) -> list[dict]:
-        return self.todo.snapshot()
+        return todo.shared_snapshot(self.todo_path, self.todo_lock)
 
     def execute_todo(
         self,
@@ -365,7 +364,7 @@ class Session:
                     for event in events
                 ):
                     raise ValueError("工具调用已经完成")
-                items, next_id = self.todo.read()
+                items, next_id = todo.load_shared(self.todo_path)
                 if command.action == "delete":
                     requests = [
                         event.data
@@ -379,7 +378,7 @@ class Session:
                         if event.type == "tool.confirmation_resolved" and matches(event)
                     ]
                     validate_delete_confirmation(command, items, requests, choices)
-            result, store = self.todo.execute(command, items, next_id, start=start)
+            result, store = todo.execute_shared(command, items, next_id, start=start)
             if result is None:
                 return None
             check(self.guard, result)
@@ -392,7 +391,7 @@ class Session:
                 ]
                 if not events or events[-1].type in _TERMINAL:
                     raise ValueError("运行已经结束")
-                self.todo.commit(command, store, next_id)
+                todo.commit_shared(self.todo_path, command, store, next_id)
                 self._append_event(
                     records,
                     run_id,
@@ -480,45 +479,44 @@ async def run_sync(function: Callable, *args, **kwargs):
     )
 
 
-class SessionManager:
-    def __init__(
-        self,
-        root: Path = Path(__file__).resolve().parents[2] / ".data" / "sessions",
-        *,
-        secrets: tuple[str, ...],
-    ) -> None:
-        self.root = root.resolve()
-        self.root.mkdir(parents=True, exist_ok=True)
-        (self.root / ".locks").mkdir(exist_ok=True)
-        self.secrets = secrets
+def _session_root(root: Path) -> Path:
+    root = root.resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    (root / ".locks").mkdir(exist_ok=True)
+    return root
 
-    def create(self) -> Session:
-        session = Session(self.root, uuid4().hex, self.secrets)
-        with session.lock:
-            header = SessionHeader(version=1, id=session.id, created_at=_now())
-            check(session.guard, header.model_dump(mode="json"))
-            with session.path.open("xb") as file:
-                file.write((header.model_dump_json() + "\n").encode("utf-8"))
-                file.flush()
-                os.fsync(file.fileno())
-        return session
 
-    def open(self, session_id: str) -> Session:
-        session = Session(self.root, session_id, self.secrets)
-        session.read()
-        return session
+def create_session(root: Path, *, secrets: tuple[str, ...]) -> Session:
+    session = Session(_session_root(root), uuid4().hex, secrets)
+    with session.lock:
+        header = SessionHeader(version=1, id=session.id, created_at=_now())
+        check(session.guard, header.model_dump(mode="json"))
+        with session.path.open("xb") as file:
+            file.write((header.model_dump_json() + "\n").encode("utf-8"))
+            file.flush()
+            os.fsync(file.fileno())
+    return session
 
-    def recover(self) -> dict[str, list[ExecutionEvent]]:
-        return {
-            session_id: self.open(session_id).recover() for session_id, _ in self.list()
-        }
 
-    def list(self) -> list[tuple[str, str]]:
-        result = []
-        for path in sorted(self.root.glob("*.jsonl")):
-            session = self.open(path.stem)
-            titles = [
-                r.title for r in session.read() if isinstance(r, SessionInfoRecord)
-            ]
-            result.append((session.id, titles[-1] if titles else ""))
-        return result
+def open_session(root: Path, session_id: str, *, secrets: tuple[str, ...]) -> Session:
+    session = Session(_session_root(root), session_id, secrets)
+    session.read()
+    return session
+
+
+def recover_sessions(
+    root: Path, *, secrets: tuple[str, ...]
+) -> dict[str, list[ExecutionEvent]]:
+    return {
+        session_id: open_session(root, session_id, secrets=secrets).recover()
+        for session_id, _ in list_sessions(root, secrets=secrets)
+    }
+
+
+def list_sessions(root: Path, *, secrets: tuple[str, ...]) -> list[tuple[str, str]]:
+    result = []
+    for path in sorted(_session_root(root).glob("*.jsonl")):
+        session = open_session(root, path.stem, secrets=secrets)
+        titles = [r.title for r in session.read() if isinstance(r, SessionInfoRecord)]
+        result.append((session.id, titles[-1] if titles else ""))
+    return result

@@ -7,6 +7,7 @@ from pydantic import BaseModel, JsonValue, TypeAdapter
 
 from ..security import check, create_guard
 from .calculator import Calculation, calculate
+from .files import ReadFile, WriteFile, decode_content, read, write
 from .search import SearchQuery, search
 from .todo import TodoCommand, TodoList
 from .todo import (
@@ -70,6 +71,8 @@ def execute(
     check(guard, TypeAdapter(JsonValue).validate_json(arguments))
     parameters = tool.parameters.model_validate_json(arguments)
     check(guard, parameters)
+    if isinstance(parameters, WriteFile):
+        check(guard, decode_content(parameters.content, parameters.encoding))
     if tool.contextual:
         if context is None:
             raise ValueError("工具执行需要运行上下文")
@@ -84,10 +87,19 @@ def execute(
         return None
     if not isinstance(result, str):
         raise TypeError(f"工具返回值必须是字符串: {name}")
+    if isinstance(parameters, ReadFile):
+        check(guard, decode_content(result, parameters.encoding))
     return result
 
 
-def create_loop_registry() -> ToolRegistry:
+def create_registry(
+    todo_list: TodoList | None,
+    todo_snapshot: Callable[[], list[dict]] | None = None,
+    *,
+    todo_execute: Callable[..., str | None] | None = None,
+) -> ToolRegistry:
+    if todo_list is None and todo_execute is None:
+        raise ValueError("待办工具缺少执行器")
     tools: ToolRegistry = {}
     register(
         tools,
@@ -116,18 +128,24 @@ def create_loop_registry() -> ToolRegistry:
             execute=search,
         ),
     )
-    return tools
-
-
-def create_full_registry(
-    todo_list: TodoList | None,
-    todo_snapshot: Callable[[], list[dict]] | None = None,
-    *,
-    todo_execute: Callable[..., str | None] | None = None,
-) -> ToolRegistry:
-    if todo_list is None and todo_execute is None:
-        raise ValueError("待办工具缺少执行器")
-    tools = create_loop_registry()
+    register(
+        tools,
+        ToolDefinition(
+            name="read",
+            description="读取文件，支持 UTF-8 文本和 Base64 编码的二进制内容。",
+            parameters=ReadFile,
+            execute=read,
+        ),
+    )
+    register(
+        tools,
+        ToolDefinition(
+            name="write",
+            description="覆盖或追加文件内容，支持 UTF-8 文本和 Base64 编码的二进制内容。",
+            parameters=WriteFile,
+            execute=write,
+        ),
+    )
     register(
         tools,
         ToolDefinition(
@@ -146,6 +164,3 @@ def create_full_registry(
         ),
     )
     return tools
-
-
-registry = create_loop_registry()

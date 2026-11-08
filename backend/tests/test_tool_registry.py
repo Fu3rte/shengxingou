@@ -5,18 +5,25 @@ from decimal import InvalidOperation
 from pydantic import ValidationError
 
 from src.agent.tools.calculator import Calculation, calculate
-from src.agent.tools.registry import ToolDefinition, create_full_registry, declarations, execute, get, register, registry
+from src.agent.tools.files import ReadFile, WriteFile, read, write
+from src.agent.tools.registry import ToolDefinition, create_registry, declarations, execute, get, register
 from src.agent.tools.search import SearchQuery, search
 from src.agent.tools.todo import TodoCommand, TodoList
 from src.agent.tools.weather import WeatherQuery, weather
 
 
+registry = create_registry(TodoList())
+
+
 class ToolRegistryTests(unittest.TestCase):
     def test_registration_and_schema(self):
         expected = [("calculate", Calculation, calculate), ("weather", WeatherQuery, weather),
-                    ("search", SearchQuery, search)]
+                    ("search", SearchQuery, search), ("read", ReadFile, read), ("write", WriteFile, write)]
         self.assertEqual([declaration["function"]["name"] for declaration in declarations(registry)],
-                         [name for name, _, _ in expected])
+                         [name for name, _, _ in expected] + ["todo"])
+        self.assertIs(get(registry, "todo").parameters, TodoCommand)
+        with self.assertRaises(ValueError):
+            create_registry(None)
         for declaration, (name, model, operation) in zip(declarations(registry), expected):
             tool = get(registry, name)
             self.assertIs(tool.parameters, model)
@@ -24,7 +31,7 @@ class ToolRegistryTests(unittest.TestCase):
             self.assertEqual(declaration, {"type": "function", "function": {
                 "name": name, "description": tool.description, "parameters": model.model_json_schema(),
             }})
-        for name in ("todo", "missing"):
+        for name in ("missing",):
             with self.subTest(name=name):
                 with self.assertRaises(ValueError):
                     get(registry, name)
@@ -74,16 +81,16 @@ class ToolRegistryTests(unittest.TestCase):
 
     def test_full_registries_bind_independent_todo_lists(self):
         stores = [TodoList(), TodoList()]
-        registries = [create_full_registry(store) for store in stores]
+        registries = [create_registry(store) for store in stores]
         for tools, store in zip(registries, stores):
             self.assertIsNot(tools, registry)
             self.assertEqual([d["function"]["name"] for d in declarations(tools)],
-                             ["calculate", "weather", "search", "todo"])
-            for declaration, model in zip(declarations(tools), (Calculation, WeatherQuery, SearchQuery, TodoCommand)):
+                             ["calculate", "weather", "search", "read", "write", "todo"])
+            for declaration, model in zip(declarations(tools), (Calculation, WeatherQuery, SearchQuery, ReadFile, WriteFile, TodoCommand)):
                 self.assertEqual(declaration["function"]["parameters"], model.model_json_schema())
             self.assertIs(get(tools, "todo").execute.args[0], store)
         self.assertEqual([d["function"]["name"] for d in declarations(registry)],
-                         ["calculate", "weather", "search"])
+                         ["calculate", "weather", "search", "read", "write", "todo"])
         first, second = registries
         self.assertEqual(json.loads(execute(first, "todo", '{"action":"add","title":"甲"}'))["item"]["id"], 1)
         self.assertEqual(json.loads(execute(second, "todo", '{"action":"add","title":"乙"}'))["item"]["id"], 1)
@@ -101,7 +108,7 @@ class ToolRegistryTests(unittest.TestCase):
 
     def test_todo_confirmation_uses_shared_snapshot(self):
         store = TodoList()
-        tools = create_full_registry(store, lambda: [{"id": 7, "title": "共享任务", "status": "pending"}])
+        tools = create_registry(store, lambda: [{"id": 7, "title": "共享任务", "status": "pending"}])
         confirmation = get(tools, "todo").confirmation
         self.assertIsNotNone(confirmation)
         self.assertIsNone(confirmation(TodoCommand(action="list")))

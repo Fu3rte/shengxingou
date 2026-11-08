@@ -18,7 +18,7 @@ from .session import (
     run_sync,
 )
 from .session_records import ExecutionEvent
-from .tools.registry import ToolRegistry, create_full_registry
+from .tools.registry import ToolRegistry, create_registry
 from .types import UserMessage
 from ..ai.models.openai import reject_cookies, validate_client
 
@@ -77,7 +77,7 @@ async def create_agent(session: Session, client: AsyncOpenAI, model: str) -> Age
         else:
             session.guard = guard
         await run_sync(session.recover)
-    registry = create_full_registry(
+    registry = create_registry(
         None, session.todo_snapshot, todo_execute=session.execute_todo
     )
     return Agent(session, client, client.copy(), credentials, model, registry, state)

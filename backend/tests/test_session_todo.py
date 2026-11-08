@@ -2,11 +2,12 @@ import json
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from pathlib import Path
 from threading import Barrier
 
-from src.agent.session import SessionManager
-from src.agent.tools.registry import create_full_registry, execute, get
+from src.agent.session import create_session, open_session
+from src.agent.tools.registry import create_registry, execute, get
 
 
 class SessionTodoTests(unittest.TestCase):
@@ -15,8 +16,10 @@ class SessionTodoTests(unittest.TestCase):
         root.mkdir(exist_ok=True)
         self.directory = tempfile.TemporaryDirectory(dir=root)
         self.addCleanup(self.directory.cleanup)
-        self.manager = SessionManager(Path(self.directory.name), secrets=("secret-key",))
-        self.session = self.manager.create()
+        self.root = Path(self.directory.name)
+        self.create = partial(create_session, self.root, secrets=("secret-key",))
+        self.open = partial(open_session, self.root, secrets=("secret-key",))
+        self.session = self.create()
         self.session.append_event("r1", "run.started", {"input": "任务"})
 
     def call(self, run_id, index, call_id, command):
@@ -37,11 +40,11 @@ class SessionTodoTests(unittest.TestCase):
         self.session.append_event("r1", "tool.confirmation_resolved", {"turn_index": 3, "tool_call_id": "c3", "decision": "approved"})
         self.assertEqual(json.loads(self.session.execute_todo("r1", 3, "c3", arguments))["deleted"]["id"], 2)
         self.session.append_event("r1", "run.finished", {"status": "failed"})
-        self.session = self.manager.open(self.session.id)
+        self.session = self.open(self.session.id)
         self.assertEqual(self.session.todo_snapshot(), [{"id": 1, "title": "一", "status": "pending"}])
         self.session.append_event("r2", "run.started", {"input": "继续"})
         self.assertEqual(self.call("r2", 1, "c4", {"action": "add", "title": "三"})["item"]["id"], 3)
-        other = self.manager.create()
+        other = self.create()
         self.assertEqual(other.todo_snapshot(), [
             {"id": 1, "title": "一", "status": "pending"},
             {"id": 3, "title": "三", "status": "pending"},
@@ -50,7 +53,7 @@ class SessionTodoTests(unittest.TestCase):
         self.assertEqual([json.loads(line) for line in lines], [{"next_id": 4}, *other.todo_snapshot()])
 
     def test_cross_session_updates_and_concurrent_adds(self):
-        sessions = [self.manager.create() for _ in range(8)]
+        sessions = [self.create() for _ in range(8)]
         barrier = Barrier(len(sessions))
 
         def add(index):
@@ -66,19 +69,19 @@ class SessionTodoTests(unittest.TestCase):
         self.assertEqual(sorted(ids), list(range(1, 9)))
         self.assertEqual(len(self.session.todo_snapshot()), 8)
         changed = self.call("r1", 1, "status", {"action": "set_status", "id": 1, "status": "completed"})["item"]
-        self.assertEqual(self.manager.open(sessions[0].id).todo_snapshot()[0], changed)
+        self.assertEqual(self.open(sessions[0].id).todo_snapshot()[0], changed)
         arguments = json.dumps({"action": "delete", "id": 1})
         self.session.append_event("r1", "tool.started", {"turn_index": 2, "tool_call_id": "delete", "name": "todo", "arguments": arguments})
         self.session.append_event("r1", "tool.confirmation_requested", {"turn_index": 2, "tool_call_id": "delete", "name": "todo", "action": "delete", "task": {"id": 1, "title": changed["title"]}})
         self.session.append_event("r1", "tool.confirmation_resolved", {"turn_index": 2, "tool_call_id": "delete", "decision": "approved"})
         self.session.execute_todo("r1", 2, "delete", arguments)
-        self.assertEqual(len(self.manager.open(sessions[0].id).todo_snapshot()), 7)
+        self.assertEqual(len(self.open(sessions[0].id).todo_snapshot()), 7)
 
     def test_registry_executes_shared_todo(self):
-        other = self.manager.create()
+        other = self.create()
         other.append_event("other", "run.started", {"input": "查看"})
-        first_registry = create_full_registry(None, self.session.todo_snapshot, todo_execute=self.session.execute_todo)
-        other_registry = create_full_registry(None, other.todo_snapshot, todo_execute=other.execute_todo)
+        first_registry = create_registry(None, self.session.todo_snapshot, todo_execute=self.session.execute_todo)
+        other_registry = create_registry(None, other.todo_snapshot, todo_execute=other.execute_todo)
         arguments = '{"action":"add","title":"共享"}'
         self.session.append_event("r1", "tool.started", {"turn_index": 1, "tool_call_id": "add",
                                                         "name": "todo", "arguments": arguments})
@@ -122,7 +125,7 @@ class SessionTodoTests(unittest.TestCase):
         self.session.append_event("r1", "tool.confirmation_resolved", {
             "turn_index": 2, "tool_call_id": "delete", "decision": "approved",
         })
-        other = self.manager.create()
+        other = self.create()
         other.append_event("other", "run.started", {"input": "删除"})
         other.append_event("other", "tool.started", {"turn_index": 2, "tool_call_id": "delete",
                                                        "name": "todo", "arguments": arguments})
@@ -147,7 +150,7 @@ class SessionTodoTests(unittest.TestCase):
         self.session.append_event("r1", "tool.confirmation_resolved", {"turn_index": 4, "tool_call_id": "delete", "decision": "approved"})
         self.session.execute_todo("r1", 4, "delete", arguments)
         original = self.session.path.read_text(encoding="utf-8")
-        self.manager.open(self.session.id)
+        self.open(self.session.id)
         invalid = [
             ("add", '{"item":{"id":1,"title":"其他","status":"pending"}}'),
             ("add", "{"),
@@ -165,9 +168,9 @@ class SessionTodoTests(unittest.TestCase):
                 event["data"]["result"] = result
                 self.session.path.write_text("".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records), encoding="utf-8")
                 with self.assertRaises(ValueError):
-                    self.manager.open(self.session.id)
+                    self.open(self.session.id)
         self.session.path.write_text(original, encoding="utf-8")
-        self.manager.open(self.session.id)
+        self.open(self.session.id)
 
     def test_shared_file_validation_rejects_corruption(self):
         self.call("r1", 1, "add", {"action": "add", "title": "任务"})
@@ -180,9 +183,9 @@ class SessionTodoTests(unittest.TestCase):
             with self.subTest(content=content):
                 path.write_bytes(content)
                 with self.assertRaises(ValueError):
-                    self.manager.create().todo_snapshot()
+                    self.create().todo_snapshot()
         path.write_bytes(original)
-        self.assertEqual(self.manager.create().todo_snapshot(), [{"id": 1, "title": "任务", "status": "pending"}])
+        self.assertEqual(self.create().todo_snapshot(), [{"id": 1, "title": "任务", "status": "pending"}])
 
     def test_delete_confirmation_uses_current_status_after_other_session_update(self):
         self.call("r1", 1, "add", {"action": "add", "title": "任务"})
@@ -190,7 +193,7 @@ class SessionTodoTests(unittest.TestCase):
         self.session.append_event("r1", "tool.started", {"turn_index": 2, "tool_call_id": "delete", "name": "todo", "arguments": arguments})
         self.session.append_event("r1", "tool.confirmation_requested", {"turn_index": 2, "tool_call_id": "delete", "name": "todo", "action": "delete", "task": {"id": 1, "title": "任务"}})
         self.session.append_event("r1", "tool.confirmation_resolved", {"turn_index": 2, "tool_call_id": "delete", "decision": "approved"})
-        other = self.manager.create()
+        other = self.create()
         other.append_event("other", "run.started", {"input": "修改"})
         update = '{"action":"set_status","id":1,"status":"completed"}'
         other.append_event("other", "tool.started", {"turn_index": 1, "tool_call_id": "status", "name": "todo", "arguments": update})
@@ -209,7 +212,7 @@ class SessionTodoTests(unittest.TestCase):
         self.session.append_event("r1", "tool.confirmation_resolved", {"turn_index": 2, "tool_call_id": "delete", "decision": "approved"})
         with self.assertRaisesRegex(ValueError, "待办删除尚未确认"):
             self.session.execute_todo("r1", 2, "delete", arguments)
-        self.assertEqual(self.manager.create().todo_snapshot(), [{"id": 1, "title": "现有标题", "status": "pending"}])
+        self.assertEqual(self.create().todo_snapshot(), [{"id": 1, "title": "现有标题", "status": "pending"}])
         self.assertNotIn("tool.completed", [event.type for event in self.session.trace("r1") if event.data.get("tool_call_id") == "delete"])
 
     def test_finished_run_does_not_modify_shared_file(self):
@@ -225,7 +228,7 @@ class SessionTodoTests(unittest.TestCase):
         self.assertEqual(self.session.todo_snapshot(), [])
 
     def test_escaped_secret_does_not_modify_todo(self):
-        session = SessionManager(Path(self.directory.name), secrets=("secret",)).create()
+        session = create_session(self.root, secrets=("secret",))
         session.append_event("run", "run.started", {"input": "x"})
         arguments = '{"action":"add","title":"\\u0073ecret"}'
         with self.assertRaisesRegex(ValueError, "密钥"):
@@ -236,8 +239,7 @@ class SessionTodoTests(unittest.TestCase):
         self.assertEqual([event.type for event in session.trace("run")], ["run.started"])
 
     def test_result_security_failure_does_not_commit_in_memory(self):
-        manager = SessionManager(Path(self.directory.name), secrets=("pending",))
-        session = manager.create()
+        session = create_session(self.root, secrets=("pending",))
         session.append_event("run", "run.started", {"input": "x"})
         arguments = '{"action":"add","title":"safe"}'
         session.append_event("run", "tool.started", {"turn_index": 1, "tool_call_id": "c1", "name": "todo", "arguments": arguments})
@@ -245,7 +247,7 @@ class SessionTodoTests(unittest.TestCase):
             session.execute_todo("run", 1, "c1", arguments)
         self.assertEqual(session.todo_snapshot(), [])
         self.assertEqual([event.type for event in session.trace("run")], ["run.started", "tool.started"])
-        reopened = SessionManager(Path(self.directory.name), secrets=()).open(session.id)
+        reopened = open_session(self.root, session.id, secrets=())
         self.assertEqual(json.loads(reopened.execute_todo("run", 1, "c1", arguments))["item"]["id"], 1)
 
     def test_rejection_stops_run_and_uncommitted_change_isolated(self):
@@ -260,7 +262,7 @@ class SessionTodoTests(unittest.TestCase):
         self.assertEqual(self.session.trace("r1")[-1].data["status"], "stopped")
         with self.assertRaises(ValueError):
             self.session.execute_todo("r1", 3, "c3", arguments)
-        self.assertEqual(len(self.manager.open(self.session.id).todo_snapshot()), 1)
+        self.assertEqual(len(self.open(self.session.id).todo_snapshot()), 1)
 
 
 if __name__ == "__main__":

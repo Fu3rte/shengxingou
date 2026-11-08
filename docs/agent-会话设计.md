@@ -4,7 +4,7 @@
 
 - `backend/src/agent/session_records.py`：记录类型、JSONL 解析和历史事件校验。
 - `backend/src/agent/session_stream.py`：模型流归一化、事件序号和文件变化检测，通过 Session 的公开读写接口保存记录。
-- `backend/src/agent/session.py`：Session、SessionManager、文件读写、锁、工具执行协调、上下文和恢复。
+- `backend/src/agent/session.py`：Session、会话管理函数、文件读写、锁、工具执行协调、上下文和恢复。
 
 ## 存储结构
 

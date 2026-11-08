@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, patch
 from openai import APIConnectionError, AsyncOpenAI
 
 from src.agent.runtime import append_message, close, create_agent, events, trace, wait
-from src.agent.session import SessionManager
+from src.agent.session import create_session
 from src.agent.tools.registry import declarations, get
 from src.ai.models.openai import validate_client
 from src.ai.models.openai_stream import model_response
@@ -19,7 +19,7 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
         directory = Path(__file__).resolve().parents[2] / ".tool-tmp"
         directory.mkdir(exist_ok=True)
         with tempfile.TemporaryDirectory(dir=directory) as folder:
-            session = SessionManager(Path(folder), secrets=()).create()
+            session = create_session(Path(folder), secrets=())
             client = AsyncOpenAI(api_key="test-key", max_retries=0)
             agent = await create_agent(session, client, "test-model")
             try:
@@ -28,7 +28,7 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
                     await append_message(agent, " ")
                 self.assertEqual(
                     [tool["function"]["name"] for tool in declarations(agent.registry)],
-                    ["calculate", "weather", "search", "todo"],
+                    ["calculate", "weather", "search", "read", "write", "todo"],
                 )
                 self.assertEqual(get(agent.registry, "todo").execute, session.execute_todo)
                 await asyncio.to_thread(session.append_event, "run", "run.started", {"input": "hello"})
@@ -46,7 +46,7 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
         directory = Path(__file__).resolve().parents[2] / ".tool-tmp"
         directory.mkdir(exist_ok=True)
         with tempfile.TemporaryDirectory(dir=directory) as folder:
-            session = SessionManager(Path(folder), secrets=()).create()
+            session = create_session(Path(folder), secrets=())
             client = AsyncOpenAI(api_key="test-key", max_retries=0)
             agent = await create_agent(session, client, "test-model")
             try:
@@ -66,7 +66,7 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
         directory = Path(__file__).resolve().parents[2] / ".tool-tmp"
         directory.mkdir(exist_ok=True)
         with tempfile.TemporaryDirectory(dir=directory) as folder:
-            session = SessionManager(Path(folder), secrets=()).create()
+            session = create_session(Path(folder), secrets=())
             client = AsyncOpenAI(api_key="test-key", max_retries=0)
             agent = await create_agent(session, client, "test-model")
             session.append_event("run", "run.started", {"input": "hello"})
@@ -100,8 +100,7 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
         directory = Path(__file__).resolve().parents[2] / ".tool-tmp"
         directory.mkdir(exist_ok=True)
         with tempfile.TemporaryDirectory(dir=directory) as folder:
-            manager = SessionManager(Path(folder), secrets=("test-key",))
-            sessions = [manager.create(), manager.create()]
+            sessions = [create_session(Path(folder), secrets=("test-key",)) for _ in range(2)]
             client = AsyncOpenAI(api_key="test-key", base_url="http://127.0.0.1:1/v1", max_retries=0, timeout=2)
             agents = [await create_agent(session, client, "test-model") for session in sessions]
             try:

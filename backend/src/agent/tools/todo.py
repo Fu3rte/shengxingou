@@ -1,10 +1,16 @@
 import json
+import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from threading import Lock
 from typing import Literal
+from uuid import uuid4
 
+from filelock import FileLock
 from pydantic import BaseModel, ConfigDict, Field
+
+from .files import read_bytes, write_bytes
 
 TodoStatus = Literal["pending", "in_progress", "completed"]
 TITLE_MAX_LENGTH = 200
@@ -177,3 +183,53 @@ def confirmation_request(
         "action": "delete",
         "task": {"id": item["id"], "title": item["title"]},
     }
+
+
+def shared_snapshot(path: Path, lock: FileLock) -> list[dict]:
+    with lock:
+        return load_shared(path)[0]
+
+
+def execute_shared(
+    command: TodoCommand,
+    items: list[dict],
+    next_id: int,
+    *,
+    start: Callable[[], bool] | None = None,
+) -> tuple[str | None, TodoList]:
+    store = restore(items, next_id)
+    return execute(store, command, start=start), store
+
+
+def commit_shared(path: Path, command: TodoCommand, store: TodoList, next_id: int) -> None:
+    if command.action != "list" or not path.exists():
+        save_shared(path, snapshot(store), next_id + (command.action == "add"))
+
+
+def load_shared(path: Path) -> tuple[list[dict], int]:
+    if not path.exists():
+        return [], 1
+    data = read_bytes(path)
+    if not data or not data.endswith(b"\n"):
+        raise ValueError("待办文件残缺")
+    lines = data.splitlines()
+    header = json.loads(lines[0])
+    if not isinstance(header, dict) or set(header) != {"next_id"}:
+        raise ValueError("待办文件无效")
+    items = [TodoItem.model_validate_json(line).model_dump() for line in lines[1:]]
+    store = restore(items, header["next_id"])
+    return snapshot(store), header["next_id"]
+
+
+def save_shared(path: Path, items: list[dict], next_id: int) -> None:
+    path.parent.mkdir(exist_ok=True)
+    temporary = path.parent / f"{uuid4().hex}.tmp"
+    data = "".join(
+        json.dumps(value, ensure_ascii=False) + "\n"
+        for value in ({"next_id": next_id}, *items)
+    ).encode("utf-8")
+    try:
+        write_bytes(temporary, data, "create")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)

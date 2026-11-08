@@ -3,7 +3,8 @@ import unittest
 
 from fastapi.testclient import TestClient
 
-from src.api import SESSIONS, app, manager
+from src.agent.session import create_session
+from src.api import SESSIONS, app, session_secrets
 
 
 class ApiTests(unittest.TestCase):
@@ -22,8 +23,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(self.client.get('/api/sessions/invalid/runs/run/stream', headers={'Last-Event-ID': 'x'}).status_code, 422)
 
     def test_delete_session(self):
-        sessions = manager()
-        first, second = sessions.create(), sessions.create()
+        first, second = (create_session(SESSIONS, secrets=session_secrets()) for _ in range(2))
         for session in (first, second):
             self.addCleanup(session.path.unlink, missing_ok=True)
             for suffix in ('.lock', '.stream.lock', '.tool.lock', '.run.lock'):
@@ -40,8 +40,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(self.client.get(f'/api/sessions/{second.id}').status_code, 200)
 
     def test_persisted_sse_replay_and_session_isolation(self):
-        sessions = manager()
-        first, second = sessions.create(), sessions.create()
+        first, second = (create_session(SESSIONS, secrets=session_secrets()) for _ in range(2))
         for session in (first, second):
             self.addCleanup(session.path.unlink, missing_ok=True)
             for suffix in ('.lock', '.stream.lock', '.tool.lock', '.run.lock'):

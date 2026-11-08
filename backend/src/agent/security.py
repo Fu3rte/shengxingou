@@ -1,3 +1,4 @@
+import base64
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -24,9 +25,19 @@ def create_guard(secrets: Sequence[str]) -> SecretGuard:
 def contains(guard: SecretGuard, value: Any) -> bool:
     if isinstance(value, str):
         return any(secret in value for secret in guard.secrets)
+    if isinstance(value, bytes):
+        return any(secret.encode("utf-8") in value for secret in guard.secrets)
     if isinstance(value, BaseModel):
         return contains(guard, value.model_dump(mode="json"))
     if isinstance(value, Mapping):
+        if (
+            value.get("encoding") == "base64"
+            and isinstance(value.get("content"), str)
+            and "path" in value
+            and "mode" in value
+            and contains(guard, base64.b64decode(value["content"], validate=True))
+        ):
+            return True
         return any(
             contains(guard, key) or contains(guard, item) for key, item in value.items()
         )
