@@ -37,11 +37,13 @@ npm run setup
 npm run dev
 ```
 
-访问 `http://127.0.0.1:3000`，在页面配置模型、API Key 和可选的 OpenAI 兼容接口地址。也可将 `backend/.env.example` 复制为 `backend/.env`，填写 `OPENAI_MODEL`、`OPENAI_API_KEY` 和可选的 `OPENAI_BASE_URL`。页面保存的非空配置优先生效。
+访问 `http://127.0.0.1:5143`，在页面配置模型、API Key 和可选的 OpenAI 兼容接口地址。也可将 `backend/.env.example` 复制为 `backend/.env`，填写 `OPENAI_MODEL`、`OPENAI_API_KEY` 和可选的 `OPENAI_BASE_URL`。页面保存的非空配置优先生效。
 
 使用 `Ctrl+C` 停止前后端。更新服务入口后，需要停止旧开发进程并重新启动。
 
 配置保存在本机 `backend/.data/config.json`，API Key 以明文保存；会话和执行记录保存在 `backend/.data/sessions/`。`backend/.data/` 和 `backend/.env` 已加入 Git 忽略规则，请保护本机文件。
+
+API 限制本机访问，并允许 `localhost:5143` 和 `127.0.0.1:5143` 来源发起请求。API 没有身份验证，本机程序仍可访问。
 
 ### 后端
 
@@ -71,14 +73,14 @@ uv run uvicorn src.api:app --host 127.0.0.1 --port 8765 --no-access-log
 ```bash
 cd frontend
 npm ci
-npm run dev -- --hostname 127.0.0.1
+npm run dev -- --hostname 127.0.0.1 --port 5143
 ```
 
-浏览器访问 `http://127.0.0.1:3000`。
+浏览器访问 `http://127.0.0.1:5143`。
 
 生产构建与启动：
 
 ```bash
 npm run build
-npm run start -- --hostname 127.0.0.1
+npm run start -- --hostname 127.0.0.1 --port 5143
 ```

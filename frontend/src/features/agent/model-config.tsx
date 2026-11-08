@@ -30,6 +30,7 @@ export function ModelConfig({
     const [model, setModel] = useState('');
     const [baseUrl, setBaseUrl] = useState('');
     const [apiKey, setApiKey] = useState('');
+    const [reasoningField, setReasoningField] = useState('reasoning_content');
     const [apiKeySet, setApiKeySet] = useState(false);
     const [pending, setPending] = useState(false);
     const [error, setError] = useState('');
@@ -50,6 +51,7 @@ export function ModelConfig({
                 const config = await response.json();
                 setModel(config.model ?? '');
                 setBaseUrl(config.base_url ?? '');
+                setReasoningField(config.reasoning_field);
                 setApiKey('');
                 setApiKeySet(config.api_key_set ?? false);
                 setError('');
@@ -74,6 +76,7 @@ export function ModelConfig({
                     model,
                     base_url: baseUrl,
                     api_key: apiKey,
+                    reasoning_field: reasoningField,
                 }),
             });
             const result = await response.json();
@@ -118,6 +121,17 @@ export function ModelConfig({
                             id='config-base-url'
                             value={baseUrl}
                             onChange={(event) => setBaseUrl(event.target.value)}
+                            disabled={pending}
+                            autoComplete='off'
+                            spellCheck={false}
+                        />
+                    </div>
+                    <div className='grid gap-2'>
+                        <Label htmlFor='config-reasoning-field'>思考字段</Label>
+                        <Input
+                            id='config-reasoning-field'
+                            value={reasoningField}
+                            onChange={(event) => setReasoningField(event.target.value)}
                             disabled={pending}
                             autoComplete='off'
                             spellCheck={false}

@@ -8,6 +8,7 @@ from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from openai import AsyncOpenAI
 from pydantic import BaseModel, Field
@@ -57,7 +58,7 @@ def resolve_config():
             ("base_url", "OPENAI_BASE_URL"),
             ("api_key", "OPENAI_API_KEY"),
         )
-    }
+    } | {"reasoning_field": saved.get("reasoning_field") or "reasoning_content"}
 
 
 def public_config():
@@ -67,6 +68,7 @@ def public_config():
         "base_url": settings["base_url"],
         "api_key": "••••••••" if settings["api_key"] else "",
         "api_key_set": bool(settings["api_key"]),
+        "reasoning_field": settings["reasoning_field"],
     }
 
 
@@ -117,7 +119,7 @@ async def _get_loop(session_id):
         )
         async with AsyncExitStack() as cleanup:
             cleanup.push_async_callback(_close_client, client)
-            agent = await create_agent(session, client, settings["model"])
+            agent = await create_agent(session, client, settings["model"], settings["reasoning_field"])
             loops[session_id] = (agent, client)
             cleanup.pop_all()
     return loops[session_id][0]
@@ -142,7 +144,9 @@ async def lifespan(app):
 
 
 app = FastAPI(lifespan=lifespan)
+allowed_origins = {"http://localhost:5143", "http://127.0.0.1:5143"}
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=["localhost", "127.0.0.1"])
+app.add_middleware(CORSMiddleware, allow_origins=list(allowed_origins), allow_methods=["*"], allow_headers=["*"])
 
 
 @app.exception_handler(InvalidConfirmation)
@@ -155,9 +159,8 @@ async def check_origin(request: Request, call_next):
     if request.client is None or request.client.host not in {"127.0.0.1", "::1"}:
         return JSONResponse({"detail": "仅允许本机访问"}, status_code=403)
     origin = request.headers.get("origin")
-    allowed = {"http://localhost:3000", "http://127.0.0.1:3000"}
-    if (origin and origin not in allowed) or (
-        request.method not in {"GET", "HEAD"} and origin not in allowed
+    if (origin and origin not in allowed_origins) or (
+        request.method not in {"GET", "HEAD"} and origin not in allowed_origins
     ):
         return JSONResponse({"detail": "来源不允许"}, status_code=403)
     return await call_next(request)
@@ -167,6 +170,7 @@ class ConfigInput(BaseModel):
     model: str = Field(min_length=1, max_length=200)
     base_url: str = Field(default="", max_length=2000)
     api_key: str = Field(default="", max_length=2000)
+    reasoning_field: str = Field(default="reasoning_content", max_length=100)
 
 
 class MessageInput(BaseModel):
@@ -185,12 +189,12 @@ async def get_config():
         return await run_sync(public_config)
 
 
-def _write_config(model, base_url, api_key):
+def _write_config(model, base_url, api_key, reasoning_field):
     CONFIG.parent.mkdir(parents=True, exist_ok=True)
     temp = CONFIG.with_suffix(".json.tmp")
     with temp.open("w", encoding="utf-8") as file:
         json.dump(
-            {"model": model, "base_url": base_url, "api_key": api_key},
+            {"model": model, "base_url": base_url, "api_key": api_key, "reasoning_field": reasoning_field},
             file,
             ensure_ascii=False,
         )
@@ -208,6 +212,12 @@ async def put_config(data: ConfigInput):
         data.api_key.strip(),
     )
     url = urlsplit(base_url)
+    reasoning_field = data.reasoning_field.strip()
+    if (
+        not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,99}", reasoning_field)
+        or reasoning_field in {"content", "refusal", "tool_calls", "role", "function_call"}
+    ):
+        raise HTTPException(422, "思考字段无效")
     if not model or (
         base_url
         and (
@@ -227,13 +237,13 @@ async def put_config(data: ConfigInput):
         key = api_key or current.get("api_key") or os.environ.get("OPENAI_API_KEY", "")
         env_key = os.environ.get("OPENAI_API_KEY", "")
         if any(
-            secret and (secret in model or secret in base_url)
+            secret and (secret in model or secret in base_url or secret in reasoning_field)
             for secret in (key, env_key)
         ):
-            raise HTTPException(422, "模型或接口地址包含密钥")
+            raise HTTPException(422, "模型配置包含密钥")
         await close_loops()
         return await run_sync(
-            _write_config, model, base_url, api_key or current.get("api_key", "")
+            _write_config, model, base_url, api_key or current.get("api_key", ""), reasoning_field
         )
 
 

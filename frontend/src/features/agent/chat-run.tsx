@@ -34,6 +34,7 @@ export const ChatRun = memo(function ChatRun({
     last: undefined as AgentEvent | undefined,
     visible: [] as AgentEvent[],
     text: new Map<number, string>(),
+    reasoning: new Map<number, string>(),
     results: new Map<string, AgentEvent>(),
     resolved: new Set<string>(),
   });
@@ -47,6 +48,7 @@ export const ChatRun = memo(function ChatRun({
       last: undefined,
       visible: [],
       text: new Map(),
+      reasoning: new Map(),
       results: new Map(),
       resolved: new Set(),
     };
@@ -54,13 +56,13 @@ export const ChatRun = memo(function ChatRun({
   const data = cache.current;
   for (let index = data.count; index < items.length; index++) {
     const event = items[index];
-    if (event.type === 'model.delta')
-      data.text.set(
-        event.data.turn_index,
-        (data.text.get(event.data.turn_index) ?? '') +
-        (event.data.fragments.text || '')
-      );
-    else if (event.type === 'tool.completed')
+    if (event.type === 'model.delta') {
+      const turn = event.data.turn_index;
+      if (event.data.fragments.text)
+        data.text.set(turn, (data.text.get(turn) ?? '') + event.data.fragments.text);
+      if (event.data.fragments.reasoning)
+        data.reasoning.set(turn, (data.reasoning.get(turn) ?? '') + event.data.fragments.reasoning);
+    } else if (event.type === 'tool.completed')
       data.results.set(key(event), event);
     else if (event.type === 'tool.confirmation_resolved')
       data.resolved.add(key(event));
@@ -99,14 +101,22 @@ export const ChatRun = memo(function ChatRun({
           );
         if (event.type === 'model.request') {
           const text = data.text.get(item.turn_index);
-          return text ? (
-            <div
-              key={event.seq}
-              className='chat-markdown px-1 leading-7'
-            >
-              <Markdown remarkPlugins={[remarkGfm]} skipHtml>
-                {text}
-              </Markdown>
+          const reasoning = data.reasoning.get(item.turn_index);
+          return text || reasoning ? (
+            <div key={event.seq} className='space-y-4'>
+              {reasoning && (
+                <details className='rounded-xl border bg-card px-4 py-3 text-sm'>
+                  <summary className='cursor-pointer font-medium'>思考过程</summary>
+                  <div className='chat-markdown mt-2 break-words'>
+                    <Markdown remarkPlugins={[remarkGfm]} skipHtml>{reasoning}</Markdown>
+                  </div>
+                </details>
+              )}
+              {text && (
+                <div className='chat-markdown px-1 leading-7'>
+                  <Markdown remarkPlugins={[remarkGfm]} skipHtml>{text}</Markdown>
+                </div>
+              )}
             </div>
           ) : null;
         }

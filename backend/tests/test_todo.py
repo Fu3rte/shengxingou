@@ -40,6 +40,24 @@ class TodoTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             TodoCommand(action="set_status", id=1, status="done")
 
+    def test_update_title_preserves_status_and_validates_input(self):
+        execute(self.store, TodoCommand(action="add", title="整理资料"))
+        execute(self.store, TodoCommand(action="set_status", id=1, status="completed"))
+        result = json.loads(execute(self.store, TodoCommand(action="update", id=1, title="  修改标题  ")))
+        self.assertEqual(result, {"item": {"id": 1, "title": "修改标题", "status": "completed"}})
+        for command in (
+            TodoCommand(action="update", id=2, title="不存在"),
+            TodoCommand(action="update", id=1),
+            TodoCommand(action="update", title="缺少 ID"),
+            TodoCommand(action="update", id=1, title="   "),
+        ):
+            with self.subTest(command=command), self.assertRaises(ValueError):
+                execute(self.store, command)
+        for title in ("", "字" * 201):
+            with self.subTest(title=title), self.assertRaises(ValidationError):
+                TodoCommand(action="update", id=1, title=title)
+        self.assertEqual(snapshot(self.store), [result["item"]])
+
     def test_delete(self):
         execute(self.store, TodoCommand(action="add", title="整理资料"))
         execute(self.store, TodoCommand(action="add", title="写周报"))

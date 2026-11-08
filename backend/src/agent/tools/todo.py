@@ -27,15 +27,15 @@ class TodoItem(BaseModel):
 class TodoCommand(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    action: Literal["add", "list", "set_status", "delete"]
+    action: Literal["add", "list", "update", "set_status", "delete"]
     title: str | None = Field(
         default=None,
         min_length=1,
         max_length=TITLE_MAX_LENGTH,
-        description="任务标题，add 时必填",
+        description="任务标题，add 与 update 时必填",
     )
     id: int | None = Field(
-        default=None, ge=1, description="任务 ID，set_status 与 delete 时必填"
+        default=None, ge=1, description="任务 ID，update、set_status 与 delete 时必填"
     )
     status: TodoStatus | None = Field(default=None, description="set_status 时必填")
 
@@ -73,6 +73,15 @@ def snapshot(store: TodoList) -> list[dict]:
         return [dict(item) for item in store.items.values()]
 
 
+def update(store: TodoList, item_id: int, title: str) -> dict:
+    with store.lock:
+        item = store.items.get(item_id)
+        if item is None:
+            raise ValueError(f"任务不存在: {item_id}")
+        item["title"] = title
+        return dict(item)
+
+
 def set_status(store: TodoList, item_id: int, status: TodoStatus) -> dict:
     with store.lock:
         item = store.items.get(item_id)
@@ -105,6 +114,13 @@ def execute(
             return json.dumps({"item": add(store, title)}, ensure_ascii=False)
         case "list":
             return json.dumps({"items": snapshot(store)}, ensure_ascii=False)
+        case "update":
+            if command.id is None or command.title is None:
+                raise ValueError("update 需要 id 与 title")
+            title = command.title.strip()
+            if not title:
+                raise ValueError("标题不能为空")
+            return json.dumps({"item": update(store, command.id, title)}, ensure_ascii=False)
         case "set_status":
             if command.id is None or command.status is None:
                 raise ValueError("set_status 需要 id 与 status")
@@ -145,6 +161,13 @@ def validate_result(arguments: str, value: str) -> None:
             command.title is None
             or item["title"] != command.title.strip()
             or item["status"] != "pending"
+        )
+        or command.action == "update"
+        and (
+            command.id is None
+            or command.title is None
+            or item["id"] != command.id
+            or item["title"] != command.title.strip()
         )
         or command.action == "set_status"
         and (item["id"] != command.id or item["status"] != command.status)

@@ -47,6 +47,7 @@ class Agent:
     client: AsyncOpenAI
     credentials: tuple[str, ...] = field(repr=False)
     model: str
+    reasoning_field: str
     registry: ToolRegistry
     state: SessionState
 
@@ -59,7 +60,7 @@ class InvalidConfirmation(ValueError):
     pass
 
 
-async def create_agent(session: Session, client: AsyncOpenAI, model: str) -> Agent:
+async def create_agent(session: Session, client: AsyncOpenAI, model: str, reasoning_field: str = "reasoning_content") -> Agent:
     if not model:
         raise ValueError("模型不能为空")
     credentials = validate_client(client)
@@ -80,7 +81,7 @@ async def create_agent(session: Session, client: AsyncOpenAI, model: str) -> Age
     registry = create_registry(
         None, session.todo_snapshot, todo_execute=session.execute_todo
     )
-    return Agent(session, client, client.copy(), credentials, model, registry, state)
+    return Agent(session, client, client.copy(), credentials, model, reasoning_field, registry, state)
 
 
 def _start_run(session: Session, run_id: str, content: str) -> None:

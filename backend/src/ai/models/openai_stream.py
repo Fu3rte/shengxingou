@@ -29,7 +29,7 @@ async def model_response(agent, run_id: str, turn: int, messages: list, tools: l
                 yield chunk
 
         response = None
-        async with aclosing(record_model_stream_async(agent.session, run_id, turn, chunks())) as recorded:
+        async with aclosing(record_model_stream_async(agent.session, run_id, turn, chunks(), agent.reasoning_field)) as recorded:
             async for event in recorded:
                 if event.type == "model.response":
                     response = event.data

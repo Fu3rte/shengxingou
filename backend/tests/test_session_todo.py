@@ -77,6 +77,26 @@ class SessionTodoTests(unittest.TestCase):
         self.session.execute_todo("r1", 2, "delete", arguments)
         self.assertEqual(len(self.open(sessions[0].id).todo_snapshot()), 7)
 
+    def test_update_title_persists_and_history_is_validated(self):
+        self.call("r1", 1, "add", {"action": "add", "title": "原任务"})
+        self.call("r1", 2, "status", {"action": "set_status", "id": 1, "status": "in_progress"})
+        arguments = json.dumps({"action": "update", "id": 1, "title": "  新任务  "}, ensure_ascii=False)
+        self.session.append_event("r1", "tool.started", {"turn_index": 3, "tool_call_id": "update", "name": "todo", "arguments": arguments})
+        registry = create_registry(None, self.session.todo_snapshot, todo_execute=self.session.execute_todo)
+        result = json.loads(self.session.execute_tool(registry, "r1", 3, "update", "todo", arguments))
+        self.assertEqual(result["item"], {"id": 1, "title": "新任务", "status": "in_progress"})
+        self.assertEqual(self.create().todo_snapshot(), [result["item"]])
+        self.assertEqual(self.open(self.session.id).todo_snapshot(), [result["item"]])
+        original = self.session.path.read_text(encoding="utf-8")
+        records = [json.loads(line) for line in original.splitlines()]
+        event = next(record["event"] for record in records if record["type"] == "event"
+                     and record["event"]["type"] == "tool.completed"
+                     and record["event"]["data"]["tool_call_id"] == "update")
+        event["data"]["result"] = json.dumps({"item": {"id": 1, "title": "篡改", "status": "in_progress"}})
+        self.session.path.write_text("".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "待办记录无效"):
+            self.open(self.session.id)
+
     def test_registry_executes_shared_todo(self):
         other = self.create()
         other.append_event("other", "run.started", {"input": "查看"})

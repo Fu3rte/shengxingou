@@ -150,7 +150,7 @@ def create_registry(
         tools,
         ToolDefinition(
             name="todo",
-            description="添加、查看、修改状态或删除待办任务。",
+            description="添加、查看、修改标题或状态、删除待办任务。",
             parameters=TodoCommand,
             execute=todo_execute
             if todo_execute is not None

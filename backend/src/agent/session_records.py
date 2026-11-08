@@ -164,7 +164,7 @@ def validate_event(
                 not isinstance(key, str)
                 or not isinstance(value, str)
                 or (
-                    key != "text"
+                    key not in {"text", "reasoning"}
                     and not re.fullmatch(r"tool:\d+:(id|name|arguments)", key)
                 )
                 for key, value in fragments.items()

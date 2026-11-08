@@ -328,6 +328,33 @@ class SessionTests(unittest.TestCase):
         self.assertEqual([event.type for event in session.trace("r1")],
                          ["run.started", "model.request", "model.delta", "model.response"])
 
+    def test_reasoning_is_persisted_and_replayed(self):
+        session = self.create()
+        session.append_event("r1", "run.started", {"input": "x"})
+        session.append_event("r1", "model.request", {"turn_index": 1, "model": "example", "messages": [], "tools": []})
+        chunks = [chunk({"role": "assistant", "reasoning_content": "think "}),
+                  chunk({"reasoning_content": "again", "content": "answer"}), chunk({}, "stop")]
+        events = list(record_model_stream(session, "r1", 1, chunks))
+        replay = self.open(session.id).trace("r1")
+        self.assertEqual(replay[2:], events)
+        self.assertEqual([event.data["fragments"] for event in events[:-1]],
+                         [{"reasoning": "think "}, {"reasoning": "again"}, {"text": "answer"}])
+        self.assertIn("think ", session.path.read_text(encoding="utf-8"))
+
+    def test_reasoning_secret_is_not_persisted(self):
+        session = self.create()
+        session.append_event("r1", "run.started", {"input": "x"})
+        session.append_event("r1", "model.request", {"turn_index": 1, "model": "example", "messages": [], "tools": []})
+        stream = record_model_stream(session, "r1", 1, [
+            chunk({"role": "assistant", "reasoning_content": "secret-"}),
+            chunk({"reasoning_content": "key"}),
+        ])
+        self.assertIsNone(next(stream).data["message"])
+        with self.assertRaisesRegex(ValueError, "密钥"):
+            next(stream)
+        self.assertNotIn("secret-", session.path.read_text(encoding="utf-8"))
+        self.assertNotIn("secret-key", str(self.open(session.id).trace("r1")))
+
     def test_model_stream_rechecks_concurrent_session_writes(self):
         session = self.create()
         session.append_event("r1", "run.started", {"input": "x"})

@@ -54,6 +54,15 @@ class ConfigTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["api_key_set"])
         self.assertEqual(server.read_config()["api_key"], "sk-keep-000011112222")
 
+    async def test_reasoning_field_config(self):
+        self.assertEqual(server.resolve_config()["reasoning_field"], "reasoning_content")
+        result = await server.put_config(server.ConfigInput(model="m", reasoning_field="thought"))
+        self.assertEqual(result["reasoning_field"], "thought")
+        self.assertEqual(server.read_config()["reasoning_field"], "thought")
+        for field in ("content", "tool_calls", "delta.thought", " "):
+            with self.subTest(field=field), self.assertRaises(HTTPException):
+                await server.put_config(server.ConfigInput(model="m", reasoning_field=field))
+
     async def test_put_config_rejects_invalid_base_url(self):
         with self.assertRaises(HTTPException) as raised:
             await server.put_config(server.ConfigInput(model="m", base_url="ftp://x", api_key=""))

@@ -29,6 +29,25 @@ class NormalizedStreamTests(unittest.TestCase):
         self.assertEqual(events[-1]["data"]["message"]["content"][0]["text"], "hello world")
         self.assertNotIn("vendor", str(events))
 
+    def test_reasoning_fields_are_normalized_and_checked(self):
+        chunks = [chunk({"role": "assistant", "reasoning_content": "first "}),
+                  chunk({"reasoning_content": "step", "content": "answer"}), chunk({}, "stop")]
+        events = list(normalized_stream(chunks, []))
+        self.assertEqual([event["data"]["fragments"] for event in events[:-1]],
+                         [{"reasoning": "first "}, {"reasoning": "step"}, {"text": "answer"}])
+        self.assertEqual(events[-1]["data"]["message"]["content"][0]["text"], "answer")
+        custom = sync_stream(async_normalized_stream(async_chunks([
+            chunk({"role": "assistant", "thought": "custom"}),
+            chunk({"content": "answer"}), chunk({}, "stop"),
+        ]), [], "thought"))
+        self.assertEqual(next(custom)["data"]["fragments"], {"reasoning": "custom"})
+        self.assertEqual(len(list(custom)), 2)
+        unsafe = normalized_stream([chunk({"role": "assistant", "reasoning_content": "secret-"}),
+                                    chunk({"reasoning_content": "key"})], ["secret-key"])
+        self.assertIsNone(next(unsafe)["data"]["message"])
+        with self.assertRaisesRegex(ValueError, "密钥"):
+            next(unsafe)
+
     def test_available_usage_details_are_normalized(self):
         usage_chunk = ChatCompletionChunk.model_validate({
             "id": "response", "object": "chat.completion.chunk", "created": 1, "model": "example", "choices": [],
