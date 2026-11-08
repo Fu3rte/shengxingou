@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 
 from pydantic import JsonValue, TypeAdapter
 
-from .compact import PROMPT, Summary, size, split_recent
+from .compact import CONTEXT_TOKENS, OUTPUT_TOKENS, PROMPT, Summary, size, split_recent
 from .security import check, contains
 from .session import release_run, run_sync
 from .tools.registry import declarations, get
@@ -92,6 +92,7 @@ async def _compact_response(agent: Agent, messages: list):
                 model=agent.model,
                 messages=messages,
                 n=1,
+                max_tokens=OUTPUT_TOKENS,
                 stream=False,
             )
         )
@@ -132,14 +133,18 @@ async def run(agent: Agent, run_id: str) -> None:
                 )
                 tools = declarations(agent.registry)
                 input_size = size(messages) + size(tools)
-                if just_compacted and input_size > 80000:
-                    raise ValueError("上下文超过输入上限")
                 if requests == 64:
                     await _finish(agent, run_id, "limited")
                     return
                 older = []
                 compact = None
-                if input_size >= 72000 and not just_compacted:
+                if not just_compacted and (
+                    await run_sync(
+                        agent.session.context_tokens, run_id, agent.model, messages, tools
+                    )
+                    + OUTPUT_TOKENS
+                    > CONTEXT_TOKENS
+                ):
                     _, compact, recent = await run_sync(
                         agent.session.context_parts, run_id
                     )
@@ -174,7 +179,7 @@ async def run(agent: Agent, run_id: str) -> None:
                         _compact_response(agent, summary_messages)
                     )
                 else:
-                    if input_size > 80000:
+                    if input_size > 80000 and not just_compacted:
                         raise ValueError("上下文超过输入上限")
                     turn += 1
                     await run_sync(

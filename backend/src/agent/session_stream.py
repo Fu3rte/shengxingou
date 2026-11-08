@@ -93,13 +93,12 @@ async def record_model_stream_async(
     run_id: str,
     turn_index: int,
     chunks: AsyncIterable[ChatCompletionChunk],
-    reasoning_field: str = "reasoning_content",
 ) -> AsyncIterator[ExecutionEvent]:
     if type(turn_index) is not int or turn_index < 1:
         raise ValueError("无效 Turn 序号")
     async with AsyncFileLock(session.stream_lock.lock_file):
         state = await run_sync(_begin_model_stream, session, run_id, turn_index)
-        async for normalized in async_normalized_stream(chunks, session.guard.secrets, reasoning_field):
+        async for normalized in async_normalized_stream(chunks, session.guard.secrets):
             yield await run_sync(
                 _append_model_stream, session, run_id, turn_index, state, normalized
             )

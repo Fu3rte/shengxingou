@@ -1,6 +1,7 @@
 import asyncio
 from contextlib import aclosing
 
+from ...agent.compact import OUTPUT_TOKENS
 from ...agent.session import await_task
 from ...agent.session_stream import record_model_stream_async
 from .openai import client_credentials, validate_client
@@ -15,7 +16,8 @@ async def model_response(agent, run_id: str, turn: int, messages: list, tools: l
         if validate_client(agent.client) != agent.credentials:
             raise ValueError("运行期间不能更改密钥")
         request = asyncio.create_task(agent.client.chat.completions.create(
-            model=agent.model, messages=messages, tools=tools, n=1, stream=True,
+            model=agent.model, messages=messages, tools=tools, n=1,
+            max_tokens=OUTPUT_TOKENS, stream=True,
             stream_options={"include_usage": True},
         ))
     stream = None
@@ -29,7 +31,7 @@ async def model_response(agent, run_id: str, turn: int, messages: list, tools: l
                 yield chunk
 
         response = None
-        async with aclosing(record_model_stream_async(agent.session, run_id, turn, chunks(), agent.reasoning_field)) as recorded:
+        async with aclosing(record_model_stream_async(agent.session, run_id, turn, chunks())) as recorded:
             async for event in recorded:
                 if event.type == "model.response":
                     response = event.data

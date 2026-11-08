@@ -58,7 +58,7 @@ def resolve_config():
             ("base_url", "OPENAI_BASE_URL"),
             ("api_key", "OPENAI_API_KEY"),
         )
-    } | {"reasoning_field": saved.get("reasoning_field") or "reasoning_content"}
+    }
 
 
 def public_config():
@@ -68,7 +68,6 @@ def public_config():
         "base_url": settings["base_url"],
         "api_key": "••••••••" if settings["api_key"] else "",
         "api_key_set": bool(settings["api_key"]),
-        "reasoning_field": settings["reasoning_field"],
     }
 
 
@@ -119,7 +118,7 @@ async def _get_loop(session_id):
         )
         async with AsyncExitStack() as cleanup:
             cleanup.push_async_callback(_close_client, client)
-            agent = await create_agent(session, client, settings["model"], settings["reasoning_field"])
+            agent = await create_agent(session, client, settings["model"])
             loops[session_id] = (agent, client)
             cleanup.pop_all()
     return loops[session_id][0]
@@ -170,7 +169,6 @@ class ConfigInput(BaseModel):
     model: str = Field(min_length=1, max_length=200)
     base_url: str = Field(default="", max_length=2000)
     api_key: str = Field(default="", max_length=2000)
-    reasoning_field: str = Field(default="reasoning_content", max_length=100)
 
 
 class MessageInput(BaseModel):
@@ -189,12 +187,12 @@ async def get_config():
         return await run_sync(public_config)
 
 
-def _write_config(model, base_url, api_key, reasoning_field):
+def _write_config(model, base_url, api_key):
     CONFIG.parent.mkdir(parents=True, exist_ok=True)
     temp = CONFIG.with_suffix(".json.tmp")
     with temp.open("w", encoding="utf-8") as file:
         json.dump(
-            {"model": model, "base_url": base_url, "api_key": api_key, "reasoning_field": reasoning_field},
+            {"model": model, "base_url": base_url, "api_key": api_key},
             file,
             ensure_ascii=False,
         )
@@ -212,12 +210,6 @@ async def put_config(data: ConfigInput):
         data.api_key.strip(),
     )
     url = urlsplit(base_url)
-    reasoning_field = data.reasoning_field.strip()
-    if (
-        not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,99}", reasoning_field)
-        or reasoning_field in {"content", "refusal", "tool_calls", "role", "function_call"}
-    ):
-        raise HTTPException(422, "思考字段无效")
     if not model or (
         base_url
         and (
@@ -237,13 +229,13 @@ async def put_config(data: ConfigInput):
         key = api_key or current.get("api_key") or os.environ.get("OPENAI_API_KEY", "")
         env_key = os.environ.get("OPENAI_API_KEY", "")
         if any(
-            secret and (secret in model or secret in base_url or secret in reasoning_field)
+            secret and (secret in model or secret in base_url)
             for secret in (key, env_key)
         ):
             raise HTTPException(422, "模型配置包含密钥")
         await close_loops()
         return await run_sync(
-            _write_config, model, base_url, api_key or current.get("api_key", ""), reasoning_field
+            _write_config, model, base_url, api_key or current.get("api_key", "")
         )
 
 

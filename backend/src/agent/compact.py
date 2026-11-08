@@ -19,6 +19,10 @@ class Summary(BaseModel):
     open_questions: list[str]
 
 
+OUTPUT_TOKENS = 4000
+CONTEXT_TOKENS = 20000
+
+
 PROMPT = (
     "将对话整理为 JSON 对象，仅记录原始对话明确支持且对后续任务有用的信息；"
     "保留关键约束、用户偏好、已作决策、任务状态和未解决问题，不推测、不补造。"
@@ -30,6 +34,10 @@ PROMPT = (
 
 def size(value) -> int:
     return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+
+
+def estimate_tokens(messages: list, tools: list) -> float:
+    return (size(messages) + size(tools)) / 4
 
 
 def summary_message(summary: dict) -> SystemMessage:

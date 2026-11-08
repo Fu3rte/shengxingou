@@ -30,7 +30,7 @@
 
 新窗口默认创建独立 Session；刷新保留当前 Session。用户可以通过会话列表打开历史 Session。不同 Session 的消息、运行状态和上下文相互隔离。
 
-系统为本机单用户使用，不设计登录、注册和账号体系。所有 Session 共享 `backend/.data/sessions/.todo/todo.jsonl` 中的待办清单和递增 ID；待办工具事件分别保存在所属 Session 的 JSONL 中。重新打开会话时由待办模块校验历史待办结果；共享待办文件由待办模块读取和写入，Session 协调锁与事件时序。重新打开会话或重启服务时直接读取共享待办文件。
+系统为本机单用户使用，不设计登录、注册和账号体系。每个 Session 使用 `backend/.data/sessions/.todo/session-<session_id>.jsonl` 保存独立待办清单和递增 ID；待办工具事件保存在所属 Session 的 JSONL 中。重新打开会话时由待办模块校验历史待办结果；待办文件由待办模块读取和写入，Session 协调锁与事件时序。重新打开会话或重启服务时读取对应的待办文件。
 
 ## 上下文构建
 

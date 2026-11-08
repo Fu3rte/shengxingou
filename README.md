@@ -55,7 +55,7 @@ uv sync --locked
 运行测试：
 
 ```bash
-uv run python -m unittest discover -s tests
+uv run pytest
 ```
 
 仅在本机启动 API（单进程）：

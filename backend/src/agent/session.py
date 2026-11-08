@@ -9,7 +9,7 @@ from uuid import uuid4
 from filelock import FileLock
 from pydantic import JsonValue, TypeAdapter
 
-from .compact import summary_message
+from .compact import estimate_tokens, size, summary_message
 from .security import check, create_guard
 from .tools.registry import ToolRegistry, execute as execute_registered_tool
 from .tools import todo
@@ -17,6 +17,7 @@ from .tools.todo import TodoCommand, validate_delete_confirmation
 from .types import (
     AgentMessage,
     AssistantMessage,
+    CustomMessage,
     SystemMessage,
     ToolCallContent,
 )
@@ -69,8 +70,8 @@ class Session:
             str(self.root / ".locks" / f"{self.id}.stream.lock")
         )
         self.tool_lock = FileLock(str(self.root / ".locks" / f"{self.id}.tool.lock"))
-        self.todo_lock = FileLock(str(self.root / ".locks" / "todo.lock"))
-        self.todo_path = self.root / ".todo" / "todo.jsonl"
+        self.todo_lock = FileLock(str(self.root / ".locks" / f"{self.id}.todo.lock"))
+        self.todo_path = self.root / ".todo" / f"session-{self.id}.jsonl"
         self.run_lock = FileLock(
             str(self.root / ".locks" / f"{self.id}.run.lock"), thread_local=False
         )
@@ -455,6 +456,61 @@ class Session:
             if not isinstance(r.message, SystemMessage) and r.id not in covered
         ]
         return systems, compact, recent
+
+    def context_tokens(
+        self, active_run_id: str, model: str, messages: list, tools: list
+    ) -> float:
+        records = self.read()
+        visible = visible_records(records, active_run_id)
+        compact = latest_compaction(records, active_run_id)
+        compact_index = records.index(compact) if compact else -1
+        covered = set(compact.event.data["covered"]) if compact else set()
+        systems = [r for r in visible if isinstance(r.message, SystemMessage)]
+        recent = [
+            r
+            for r in visible
+            if not isinstance(r.message, (SystemMessage, CustomMessage))
+            and r.id not in covered
+        ]
+        positions = {r.id: i for i, r in enumerate(systems)}
+        positions.update(
+            {r.id: i + len(systems) + bool(compact) for i, r in enumerate(recent)}
+        )
+        requests = {}
+        responses = {}
+        baseline = None
+        for index, record in enumerate(records):
+            if isinstance(record, EventRecord):
+                event = record.event
+                key = (event.run_id, event.data.get("turn_index"))
+                if event.type == "model.request":
+                    requests[key] = event.data
+                    responses.pop(event.run_id, None)
+                elif event.type == "model.response":
+                    responses[event.run_id] = (index, requests.get(key), event.data)
+            elif isinstance(record, MessageRecord) and record.run_id in responses:
+                response_index, request, response = responses.pop(record.run_id)
+                usage = response.get("usage")
+                total = usage.get("total_tokens") if isinstance(usage, dict) else None
+                if (
+                    record.id in positions
+                    and response_index > compact_index
+                    and isinstance(record.message, AssistantMessage)
+                    and record.message.model_dump(mode="json") == response.get("message")
+                    and type(total) is int
+                    and total > 0
+                ):
+                    baseline = (positions[record.id], request, total)
+        if baseline:
+            position, request, total = baseline
+            if (
+                request is not None
+                and request["model"] == model
+                and request["tools"] == tools
+                and request["messages"] == messages[:position]
+            ):
+                return total + (size(messages[position + 1 :]) - size([])) / 4
+        return estimate_tokens(messages, tools)
 
     def context(self, active_run_id: str) -> list[AgentMessage]:
         systems, compact, recent = self.context_parts(active_run_id)

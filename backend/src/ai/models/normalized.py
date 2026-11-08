@@ -23,7 +23,6 @@ from .openai import ModelResponse, async_convert_stream
 class _NormalizedState:
     guard: SecretGuard
     stream_guard: StreamSecretGuard
-    reasoning_field: str
     received: bool = False
     reason: str | None = None
     inconsistent_reason: bool = False
@@ -102,8 +101,8 @@ def _normalized_item(
         if choice["index"] != 0:
             raise ValueError("模型响应必须包含一个 choice")
         delta = choice["delta"]
-        if delta.get(state.reasoning_field) is not None:
-            fragments.append(("reasoning", delta[state.reasoning_field]))
+        if delta.get("reasoning_content") is not None:
+            fragments.append(("reasoning", delta["reasoning_content"]))
         if delta.get("content") is not None:
             fragments.append(("text", delta["content"]))
         if delta.get("refusal") is not None:
@@ -149,10 +148,9 @@ def _failure_events(state: _NormalizedState) -> Iterator[dict[str, Any]]:
 async def async_normalized_stream(
     chunks: AsyncIterable[ChatCompletionChunk],
     secrets: Sequence[str],
-    reasoning_field: str = "reasoning_content",
 ) -> AsyncIterator[dict[str, Any]]:
     guard = create_guard(secrets)
-    state = _NormalizedState(guard, StreamSecretGuard(guard), reasoning_field)
+    state = _NormalizedState(guard, StreamSecretGuard(guard))
 
     async def observed_chunks() -> AsyncIterator[ChatCompletionChunk]:
         async for chunk in chunks:
