@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import json
 import sys
 from typing import TYPE_CHECKING
 
 from pydantic import JsonValue, TypeAdapter
 
+from .compact import PROMPT, Summary, size, split_recent
 from .security import check, contains
 from .session import release_run, run_sync
 from .tools.registry import declarations, get
@@ -17,7 +19,12 @@ from .types import (
     ToolResultMessage,
     UserMessage,
 )
-from ..ai.models.openai import to_openai_messages
+from ..ai.models.openai import (
+    client_credentials,
+    from_openai_response,
+    to_openai_messages,
+    validate_client,
+)
 from ..ai.models.openai_stream import NOT_STARTED, model_response as _model_response
 
 if TYPE_CHECKING:
@@ -74,9 +81,44 @@ def _validate_call(agent: Agent, call: ToolCallContent) -> None:
     check(agent.session.guard, parameters)
 
 
+async def _compact_response(agent: Agent, messages: list):
+    async with agent.state.condition:
+        if agent.state.stop or agent.state.shutdown:
+            return NOT_STARTED
+        if validate_client(agent.client) != agent.credentials:
+            raise ValueError("运行期间不能更改密钥")
+        request = asyncio.create_task(
+            agent.client.chat.completions.create(
+                model=agent.model,
+                messages=messages,
+                n=1,
+                stream=False,
+            )
+        )
+    try:
+        response = await request
+        if client_credentials(agent.client) != agent.credentials:
+            raise ValueError("运行期间不能更改密钥")
+        message = from_openai_response(response)
+        check(agent.session.guard, message)
+        if any(not isinstance(block, TextContent) for block in message.content):
+            raise ValueError("摘要不能包含工具调用")
+        text = "".join(block.text for block in message.content)
+        check(agent.session.guard, text)
+        summary = Summary.model_validate_json(text)
+        check(agent.session.guard, summary)
+        return summary.model_dump(mode="json")
+    finally:
+        if not request.done():
+            request.cancel()
+            await asyncio.wait({request})
+
+
 async def run(agent: Agent, run_id: str) -> None:
     state = agent.state
     turn = 0
+    requests = 0
+    just_compacted = False
     try:
         while True:
             async with state.condition:
@@ -85,28 +127,72 @@ async def run(agent: Agent, run_id: str) -> None:
                 if state.stop:
                     await _finish(agent, run_id, "stopped")
                     return
-                if turn == 64:
-                    await _finish(agent, run_id, "limited")
-                    return
                 messages = to_openai_messages(
                     await run_sync(agent.session.context, run_id)
                 )
                 tools = declarations(agent.registry)
-                turn += 1
-                await run_sync(
-                    agent.session.append_event,
-                    run_id,
-                    "model.request",
-                    {
-                        "turn_index": turn,
-                        "model": agent.model,
-                        "messages": messages,
-                        "tools": tools,
-                    },
-                )
-                state.model_task = asyncio.create_task(
-                    _model_response(agent, run_id, turn, messages, tools)
-                )
+                input_size = size(messages) + size(tools)
+                if just_compacted and input_size > 80000:
+                    raise ValueError("上下文超过输入上限")
+                if requests == 64:
+                    await _finish(agent, run_id, "limited")
+                    return
+                older = []
+                compact = None
+                if input_size >= 72000 and not just_compacted:
+                    _, compact, recent = await run_sync(
+                        agent.session.context_parts, run_id
+                    )
+                    older = split_recent(recent)
+                is_compact = bool(older)
+                if is_compact:
+                    previous = compact.event.data["summary"] if compact else None
+                    history = to_openai_messages([r.message for r in older])
+                    summary_messages = [
+                        {"role": "system", "content": PROMPT},
+                        {
+                            "role": "user",
+                            "content": json.dumps(
+                                {"previous_summary": previous, "history": history},
+                                ensure_ascii=False,
+                            ),
+                        },
+                    ]
+                    if size(summary_messages) + size([]) > 80000:
+                        raise ValueError("摘要请求超过输入上限")
+                    await run_sync(
+                        agent.session.append_event,
+                        run_id,
+                        "compact.request",
+                        {
+                            "model": agent.model,
+                            "messages": summary_messages,
+                            "tools": [],
+                        },
+                    )
+                    state.model_task = asyncio.create_task(
+                        _compact_response(agent, summary_messages)
+                    )
+                else:
+                    if input_size > 80000:
+                        raise ValueError("上下文超过输入上限")
+                    turn += 1
+                    await run_sync(
+                        agent.session.append_event,
+                        run_id,
+                        "model.request",
+                        {
+                            "turn_index": turn,
+                            "model": agent.model,
+                            "messages": messages,
+                            "tools": tools,
+                        },
+                    )
+                    state.model_task = asyncio.create_task(
+                        _model_response(agent, run_id, turn, messages, tools)
+                    )
+                requests += 1
+                just_compacted = False
                 model_task = state.model_task
                 state.condition.notify_all()
             try:
@@ -124,6 +210,28 @@ async def run(agent: Agent, run_id: str) -> None:
                     if not state.shutdown:
                         await _finish(agent, run_id, "stopped")
                 return
+            if is_compact:
+                async with state.condition:
+                    if state.shutdown:
+                        return
+                    if state.stop:
+                        await _finish(agent, run_id, "stopped")
+                        return
+                    covered = list(compact.event.data["covered"]) if compact else []
+                    covered.extend(r.id for r in older)
+                    await run_sync(
+                        agent.session.append_event,
+                        run_id,
+                        "compact.completed",
+                        {
+                            "summary": response,
+                            "covered": covered,
+                            "previous": compact.id if compact else None,
+                        },
+                    )
+                    state.condition.notify_all()
+                    just_compacted = True
+                continue
             if response is None or response["message"] is None:
                 raise ValueError("模型响应不完整")
             message = AssistantMessage.model_validate(response["message"])

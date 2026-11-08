@@ -9,6 +9,7 @@ from uuid import uuid4
 from filelock import FileLock
 from pydantic import JsonValue, TypeAdapter
 
+from .compact import summary_message
 from .security import check, create_guard
 from .tools.registry import ToolRegistry, execute as execute_registered_tool
 from .tools import todo
@@ -30,6 +31,9 @@ from .session_records import (
     parse_records,
     timestamp as _now,
     validate_event as _validate_event,
+    validate_compactions as _validate_compactions,
+    visible_records,
+    latest_compaction,
     validate_id as _id,
     validate_steering as _validate_steering,
     validate_todo_results as _validate_todo_results,
@@ -211,8 +215,11 @@ class Session:
             if any(event.type not in _TERMINAL for event in last.values()):
                 raise ValueError("会话已有运行")
         if (
-            event_type == "model.request"
-            and sum(event.type == "model.request" for event in events) >= 64
+            event_type in {"model.request", "compact.request"}
+            and sum(
+                event.type in {"model.request", "compact.request"} for event in events
+            )
+            >= 64
         ):
             raise ValueError("模型请求次数达到上限")
         now = _now()
@@ -228,6 +235,7 @@ class Session:
         _validate_steering([*records, record])
         _validate_tool_results([*records, record])
         _validate_todo_results([*records, record])
+        _validate_compactions([*records, record])
         self._append(record, ids={existing.id for existing in records})
         return event
 
@@ -434,26 +442,26 @@ class Session:
                 if event.type not in _TERMINAL
             ]
 
-    def context(self, active_run_id: str) -> list[AgentMessage]:
+    def context_parts(self, active_run_id: str):
         _id(active_run_id)
         records = self.read()
-        completed = {
-            r.event.run_id
-            for r in records
-            if isinstance(r, EventRecord) and r.event.type == "run.completed"
-        }
-        applied = {
-            r.event.data["message_id"]
-            for r in records
-            if isinstance(r, EventRecord) and r.event.type == "steer.applied"
-        }
-        messages = [
-            r.message
-            for r in records
-            if isinstance(r, MessageRecord)
-            and (r.run_id is None or r.run_id == active_run_id or r.run_id in completed)
-            and (r.queue_id is None or r.id in applied)
+        visible = visible_records(records, active_run_id)
+        compact = latest_compaction(records, active_run_id)
+        covered = set(compact.event.data["covered"]) if compact else set()
+        systems = [r.message for r in visible if isinstance(r.message, SystemMessage)]
+        recent = [
+            r
+            for r in visible
+            if not isinstance(r.message, SystemMessage) and r.id not in covered
         ]
+        return systems, compact, recent
+
+    def context(self, active_run_id: str) -> list[AgentMessage]:
+        systems, compact, recent = self.context_parts(active_run_id)
+        messages = [*systems]
+        if compact:
+            messages.append(summary_message(compact.event.data["summary"]))
+        messages.extend(r.message for r in recent)
         check(self.guard, messages)
         to_openai_messages(messages)
         return messages

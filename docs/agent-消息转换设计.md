@@ -73,7 +73,7 @@ Chat Completions 分开表示文本和工具调用，跨字段的交错顺序无
 | `model.request` | 模型名、请求消息和工具定义 |
 | `model.delta` | 通过安全检查的归一化文本或工具调用片段 |
 | `model.response` | 可用的归一化响应内容、结束原因和用量信息 |
-| 上下文压缩记录（后续） | 摘要及其覆盖的历史范围 |
+| `compact.request`、`compact.completed` | 摘要请求及结构化摘要、覆盖的消息 ID 和前一压缩记录 ID |
 | `tool.started` | 工具调用 ID、名称和原始参数 |
 | `tool.completed` | 工具调用 ID、名称、原始参数和结果 |
 | `tool.confirmation_requested` | Turn 序号、工具调用 ID、名称、操作和待办任务信息 |

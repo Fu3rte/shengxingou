@@ -42,7 +42,7 @@
 
 待办删除执行前暂停当前 Run，展示任务 ID 和内容并等待用户确认。确认后继续执行；用户拒绝或停止时，删除不执行，Run 以 `stopped` 结束。服务重启后，等待确认的 Run 按既定规则标记为 `interrupted`。
 
-每个 Run 最多发起 64 次模型请求；后续实现压缩时，摘要请求计入其中。模型响应不完整、工具错误或其他异常直接终止，并记录对应状态。需要继续请求且已达到上限时，Run 以 `limited` 状态结束。
+每个 Run 最多发起 64 次模型请求；摘要请求计入其中。模型响应不完整、工具错误或其他异常直接终止，并记录对应状态。需要继续请求且已达到上限时，Run 以 `limited` 状态结束。
 
 ## 协作式停止
 
@@ -67,7 +67,7 @@
 | `model.request` | 模型请求 |
 | `model.delta` | 通过安全检查的归一化文本或工具调用片段 |
 | `model.response` | 可用的归一化响应内容、结束原因和用量信息 |
-| 上下文压缩记录（后续） | 摘要及其覆盖的历史范围 |
+| `compact.request`、`compact.completed` | 摘要请求及结构化摘要、覆盖的消息 ID 和前一压缩记录 ID |
 | `tool.started`、`tool.completed` | 工具调用 ID、名称、参数和结果 |
 | `tool.confirmation_requested` | Turn 序号、工具调用 ID、名称、操作和待办任务信息 |
 | `tool.confirmation_resolved` | Turn 序号、工具调用 ID 和用户选择 |

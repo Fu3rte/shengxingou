@@ -42,23 +42,11 @@
 - 发送模型请求前校验工具调用与结果的 ID 配对；不完整的工具调用不能发送。
 - 同一会话同时执行一个运行；不同会话可以并发运行。
 
-## 上下文压缩
-
-当前 Session 与事件阶段不实现上下文压缩及摘要。以下保留已确定的后续设计。
-
-输入上下文预算上限为 20000 token，估算达到 18000 token 时自动压缩。系统指令、工具声明、历史摘要、近期消息和当前 Run 消息均参与输入预算统计；模型输出占用模型窗口的额外空间。
-
-使用与模型匹配的本地 tokenizer 估算 token；受支持的 OpenAI 模型使用 `tiktoken`。未知模型须显式配置兼容的计数方式，无法计数时直接报错。供应商对请求封装的计数可能存在差异，实际模型窗口也可能小于输入预算与输出所需空间。
-
-使用当前模型摘要较早的已完成 Run，保留最近两个完整 Run 和当前 Run；工具调用及其结果保持配对。摘要请求不提供工具，计入当前 Run 的模型请求次数。摘要包含用户目标、偏好、重要约束、工具结论和未解决问题；待办状态仍以共享待办文件为准。
-
-摘要、覆盖范围及压缩过程的模型请求和响应写入执行记录；摘要持久化后生效，即使触发压缩的 Run 随后失败或停止仍可使用。原始消息和事件继续保留。压缩失败或无法满足预算时，当前 Run 报错，已保存记录保持可用。
-
 ## 执行事件
 
 `event` 包含 `run_id`、从 1 开始递增的 `seq`、UTC `time`、`type` 和 `data`。事件保存在会话 JSONL 中，不进入模型上下文。
 
-事件包括 `run.started`、`model.request`、`model.delta`、`model.response`、`tool.started`、`tool.completed`、`tool.confirmation_requested`、`tool.confirmation_resolved`、`steer.queued`、`steer.applied`、`run.completed` 和 `run.finished`。上下文压缩记录属于后续设计。模型与工具事件的 `data` 包含 `turn_index`。异常、停止、超限或中断时，`run.finished` 记录对应状态及可用的错误信息。
+事件包括 `run.started`、`model.request`、`model.delta`、`model.response`、`compact.request`、`compact.completed`、`tool.started`、`tool.completed`、`tool.confirmation_requested`、`tool.confirmation_resolved`、`steer.queued`、`steer.applied`、`run.completed` 和 `run.finished`。压缩记录保存结构化摘要、覆盖的消息 ID 和前一压缩记录 ID；摘要请求单独记录，不作为业务回答流输出。模型与工具事件的 `data` 包含 `turn_index`。异常、停止、超限或中断时，`run.finished` 记录对应状态及可用的错误信息。
 
 通过密钥检查的模型请求、归一化响应片段、可用的响应信息、工具参数及结果均需记录。供应商原始 chunk 和未知扩展不写入记录或推送；归一化事件持久化后用于 SSE 补发。模型事件字段见 `agent-消息转换设计.md`；steering 和终态规则见 `agent-loop-设计.md`。异常日志关联 `run_id`，异常继续终止执行。
 

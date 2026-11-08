@@ -4,7 +4,9 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter
 
+from .compact import Summary
 from .tools.todo import validate_result as validate_todo_result
+from ..ai.models.openai import to_openai_messages
 from .types import AgentMessage, AssistantMessage, SystemMessage, ToolResultMessage
 
 
@@ -44,6 +46,8 @@ class ExecutionEvent(RecordModel):
         "model.request",
         "model.delta",
         "model.response",
+        "compact.request",
+        "compact.completed",
         "tool.started",
         "tool.completed",
         "tool.confirmation_requested",
@@ -132,6 +136,24 @@ def validate_event(
         or not isinstance(data.get("tools"), list)
     ):
         raise ValueError("无效模型请求")
+    if event.type == "compact.request" and (
+        set(data) != {"model", "messages", "tools"}
+        or not isinstance(data.get("model"), str)
+        or not isinstance(data.get("messages"), list)
+        or data.get("tools") != []
+    ):
+        raise ValueError("无效摘要请求")
+    if event.type == "compact.completed":
+        if set(data) != {"summary", "covered", "previous"}:
+            raise ValueError("无效压缩记录")
+        Summary.model_validate(data["summary"])
+        if (
+            not isinstance(data["covered"], list)
+            or not data["covered"]
+            or any(not isinstance(item, str) for item in data["covered"])
+            or (data["previous"] is not None and not isinstance(data["previous"], str))
+        ):
+            raise ValueError("无效压缩范围")
     if event.type == "model.delta":
         fragments = data.get("fragments")
         if (
@@ -287,6 +309,78 @@ def validate_todo_results(records: list[Record]) -> None:
         validate_todo_result(data["arguments"], data["result"])
 
 
+def visible_records(records: list[Record], active_run_id: str) -> list[MessageRecord]:
+    completed = {
+        r.event.run_id
+        for r in records
+        if isinstance(r, EventRecord) and r.event.type == "run.completed"
+    }
+    applied = {
+        r.event.data["message_id"]
+        for r in records
+        if isinstance(r, EventRecord) and r.event.type == "steer.applied"
+    }
+    return [
+        r
+        for r in records
+        if isinstance(r, MessageRecord)
+        and (r.run_id is None or r.run_id == active_run_id or r.run_id in completed)
+        and (r.queue_id is None or r.id in applied)
+    ]
+
+
+def latest_compaction(records: list[Record], active_run_id: str) -> EventRecord | None:
+    completed = {
+        r.event.run_id
+        for r in records
+        if isinstance(r, EventRecord) and r.event.type == "run.completed"
+    }
+    return next(
+        (
+            r
+            for r in reversed(records)
+            if isinstance(r, EventRecord)
+            and r.event.type == "compact.completed"
+            and (r.event.run_id == active_run_id or r.event.run_id in completed)
+        ),
+        None,
+    )
+
+
+def validate_compactions(records: list[Record]) -> None:
+    pending: set[str] = set()
+    for index, record in enumerate(records):
+        if not isinstance(record, EventRecord):
+            continue
+        if record.event.type == "compact.request":
+            if record.event.run_id in pending:
+                raise ValueError("摘要请求重复")
+            pending.add(record.event.run_id)
+        if record.event.type != "compact.completed":
+            continue
+        if record.event.run_id not in pending:
+            raise ValueError("摘要请求不存在")
+        pending.remove(record.event.run_id)
+        prior = records[:index]
+        run_id = record.event.run_id
+        visible = [
+            r
+            for r in visible_records(prior, run_id)
+            if not isinstance(r.message, SystemMessage)
+        ]
+        previous = latest_compaction(prior, run_id)
+        covered = record.event.data["covered"]
+        old = previous.event.data["covered"] if previous else []
+        if (
+            record.event.data["previous"] != (previous.id if previous else None)
+            or covered[: len(old)] != old
+            or len(covered) <= len(old)
+            or covered != [r.id for r in visible[: len(covered)]]
+        ):
+            raise ValueError("压缩覆盖范围无效")
+        to_openai_messages([r.message for r in visible[: len(covered)]])
+
+
 def parse_records(data: bytes, session_id: str) -> list[Record]:
     if not data or not data.endswith(b"\n"):
         raise ValueError("会话记录残缺")
@@ -295,6 +389,7 @@ def parse_records(data: bytes, session_id: str) -> list[Record]:
         raise ValueError("无效会话头")
     seen: set[str] = set()
     runs: dict[str, tuple[int, bool]] = {}
+    requests: dict[str, int] = {}
     confirmations: dict[tuple[str, int, str], bool] = {}
     for index, record in enumerate(records):
         validate_id(record.id)
@@ -302,9 +397,7 @@ def parse_records(data: bytes, session_id: str) -> list[Record]:
             raise ValueError("记录 ID 重复")
         seen.add(record.id)
         _utc(
-            record.created_at
-            if isinstance(record, SessionHeader)
-            else record.timestamp
+            record.created_at if isinstance(record, SessionHeader) else record.timestamp
         )
         if index and isinstance(record, SessionHeader):
             raise ValueError("会话头重复")
@@ -330,8 +423,13 @@ def parse_records(data: bytes, session_id: str) -> list[Record]:
             if previous == 0 and any(not ended for _, ended in runs.values()):
                 raise ValueError("会话已有运行")
             validate_event(event, confirmations)
+            if event.type in {"model.request", "compact.request"}:
+                requests[event.run_id] = requests.get(event.run_id, 0) + 1
+                if requests[event.run_id] > 64:
+                    raise ValueError("模型请求次数达到上限")
             runs[event.run_id] = (event.seq, event.type in TERMINAL)
     validate_steering(records)
     validate_tool_results(records)
     validate_todo_results(records)
+    validate_compactions(records)
     return records
