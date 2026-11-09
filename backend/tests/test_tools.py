@@ -5,7 +5,7 @@ from decimal import DecimalException
 import pytest
 from pydantic import ValidationError
 
-from src.agent.tools.registry import create_registry, declarations, execute, get, register
+from src.agent.tools.registry import create_registry, declarations, get, invoke_handler, parse_arguments, register
 from src.agent.tools.todo import TodoList
 
 
@@ -15,7 +15,8 @@ def tools():
 
 
 def call(tools, name, **arguments):
-    return execute(tools, name, json.dumps(arguments, ensure_ascii=False))
+    parameters = parse_arguments(tools, name, json.dumps(arguments, ensure_ascii=False))
+    return invoke_handler(get(tools, name), parameters)
 
 
 def test_registry_schema_and_unknown(tools):
@@ -69,6 +70,35 @@ def test_todo_lifecycle_and_invalid_commands(tools):
         call(tools, 'todo', action='delete', id=1)
     with pytest.raises(ValueError):
         call(tools, 'todo', action='add', title='  ')
+
+
+def test_unbound_todo_requires_session_storage():
+    tools = create_registry()
+    parameters = parse_arguments(tools, 'todo', '{"action":"list"}')
+    with pytest.raises(ValueError, match='会话存储'):
+        invoke_handler(get(tools, 'todo'), parameters)
+
+
+def test_json_unescape_keeps_secret_guard(tools):
+    secret = '测试密钥'
+    arguments = json.dumps({'action': 'add', 'title': secret}, ensure_ascii=True)
+    assert secret not in arguments
+    with pytest.raises(ValueError, match='密钥'):
+        parse_arguments(tools, 'todo', arguments, secrets=(secret,))
+
+
+def test_encoded_file_secret_guard(tools, tmp_path):
+    secret = 'protected-value'
+    path = tmp_path / 'secret-file'
+    arguments = json.dumps({'path': str(path), 'content': base64.b64encode(secret.encode()).decode(),
+                            'encoding': 'base64', 'mode': 'overwrite'})
+    with pytest.raises(ValueError, match='密钥'):
+        parse_arguments(tools, 'write', arguments, secrets=(secret,))
+    assert not path.exists()
+    path.write_text(secret, encoding='utf-8')
+    parameters = parse_arguments(tools, 'read', json.dumps({'path': str(path), 'encoding': 'base64'}), secrets=(secret,))
+    with pytest.raises(ValueError, match='密钥'):
+        invoke_handler(get(tools, 'read'), parameters, secrets=(secret,))
 
 
 def test_file_tools(tools, tmp_path):

@@ -9,11 +9,7 @@ from ..security import check, create_guard
 from .calculator import Calculation, calculate
 from .files import ReadFile, WriteFile, decode_content, read, write
 from .search import SearchQuery, search
-from .todo import TodoCommand, TodoList
-from .todo import (
-    execute as execute_todo,
-    confirmation_request as todo_confirmation_request,
-)
+from .todo import TodoCommand, TodoList, apply_command
 from .weather import WeatherQuery, weather
 
 
@@ -22,9 +18,7 @@ class ToolDefinition[Parameters: BaseModel]:
     name: str
     description: str
     parameters: type[Parameters]
-    execute: Callable[..., str | None]
-    confirmation: Callable[..., dict | None] | None = None
-    contextual: bool = False
+    handler: Callable[..., str | None] | None = None
 
 
 type ToolRegistry = dict[str, ToolDefinition[Any]]
@@ -56,15 +50,9 @@ def declarations(tools: ToolRegistry) -> list[dict]:
     ]
 
 
-def execute(
-    tools: ToolRegistry,
-    name: str,
-    arguments: str,
-    *,
-    secrets: tuple[str, ...] = (),
-    start: Callable[[], bool] | None = None,
-    context: tuple[str, int, str] | None = None,
-) -> str | None:
+def parse_arguments(
+    tools: ToolRegistry, name: str, arguments: str, *, secrets: tuple[str, ...] = ()
+) -> BaseModel:
     guard = create_guard(secrets)
     check(guard, {"name": name, "arguments": arguments})
     tool = get(tools, name)
@@ -73,94 +61,73 @@ def execute(
     check(guard, parameters)
     if isinstance(parameters, WriteFile):
         check(guard, decode_content(parameters.content, parameters.encoding))
-    if tool.contextual:
-        if context is None:
-            raise ValueError("工具执行需要运行上下文")
-        result = tool.execute(*context, arguments, start=start)
-    else:
-        result = (
-            tool.execute(parameters)
-            if start is None
-            else tool.execute(parameters, start=start)
-        )
+    return parameters
+
+
+def invoke_handler(
+    tool: ToolDefinition,
+    parameters: BaseModel,
+    *,
+    secrets: tuple[str, ...] = (),
+    start: Callable[[], bool] | None = None,
+) -> str | None:
+    if tool.handler is None:
+        raise ValueError("工具需要会话存储")
+    result = (
+        tool.handler(parameters)
+        if start is None
+        else tool.handler(parameters, start=start)
+    )
     if result is None and start is not None:
         return None
     if not isinstance(result, str):
-        raise TypeError(f"工具返回值必须是字符串: {name}")
+        raise TypeError(f"工具返回值必须是字符串: {tool.name}")
+    guard = create_guard(secrets)
+    check(guard, result)
     if isinstance(parameters, ReadFile):
         check(guard, decode_content(result, parameters.encoding))
     return result
 
 
-def create_registry(
-    todo_list: TodoList | None,
-    todo_snapshot: Callable[[], list[dict]] | None = None,
-    *,
-    todo_execute: Callable[..., str | None] | None = None,
-) -> ToolRegistry:
-    if todo_list is None and todo_execute is None:
-        raise ValueError("待办工具缺少执行器")
+def create_registry(todo_list: TodoList | None = None) -> ToolRegistry:
     tools: ToolRegistry = {}
-    register(
-        tools,
+    for tool in (
         ToolDefinition(
             name="calculate",
             description="计算两个数字的加、减、乘或除。",
             parameters=Calculation,
-            execute=calculate,
+            handler=calculate,
         ),
-    )
-    register(
-        tools,
         ToolDefinition(
             name="weather",
             description="查询自定义样例天气数据，结果非实时。",
             parameters=WeatherQuery,
-            execute=weather,
+            handler=weather,
         ),
-    )
-    register(
-        tools,
         ToolDefinition(
             name="search",
             description="搜索自定义样例数据，结果非实时，不联网。",
             parameters=SearchQuery,
-            execute=search,
+            handler=search,
         ),
-    )
-    register(
-        tools,
         ToolDefinition(
             name="read",
             description="读取文件，支持 UTF-8 文本和 Base64 编码的二进制内容。",
             parameters=ReadFile,
-            execute=read,
+            handler=read,
         ),
-    )
-    register(
-        tools,
         ToolDefinition(
             name="write",
             description="覆盖或追加文件内容，支持 UTF-8 文本和 Base64 编码的二进制内容。",
             parameters=WriteFile,
-            execute=write,
+            handler=write,
         ),
-    )
-    register(
-        tools,
         ToolDefinition(
             name="todo",
             description="添加、查看、修改标题或状态、删除待办任务。",
             parameters=TodoCommand,
-            execute=todo_execute
-            if todo_execute is not None
-            else partial(execute_todo, todo_list),
-            confirmation=(
-                lambda command: todo_confirmation_request(command, todo_snapshot)
-            )
-            if todo_snapshot
-            else None,
-            contextual=todo_execute is not None,
+            handler=partial(apply_command, todo_list) if todo_list is not None else None,
         ),
-    )
+    ):
+        register(tools, tool)
     return tools

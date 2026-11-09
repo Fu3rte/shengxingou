@@ -27,6 +27,7 @@ from .agent.runtime import (
     protect,
 )
 from .agent.security import contains
+from .agent import session as sessions
 from .agent.session import (
     create_session as create_session_file,
     list_sessions as list_session_files,
@@ -43,6 +44,22 @@ load_dotenv(ROOT / ".env")
 lock = asyncio.Lock()
 loops: dict[str, tuple[Agent, AsyncOpenAI]] = {}
 TERMINAL = {"run.completed", "run.finished"}
+
+
+class ConfigInput(BaseModel):
+    model: str = Field(min_length=1, max_length=200)
+    base_url: str = Field(default="", max_length=2000)
+    api_key: str = Field(default="", max_length=2000)
+
+
+class MessageInput(BaseModel):
+    content: str = Field(min_length=1, max_length=32000)
+
+
+class ConfirmationInput(BaseModel):
+    turn_index: int = Field(ge=1)
+    tool_call_id: str = Field(min_length=1)
+    decision: str
 
 
 def read_config():
@@ -164,23 +181,6 @@ async def check_origin(request: Request, call_next):
         return JSONResponse({"detail": "来源不允许"}, status_code=403)
     return await call_next(request)
 
-
-class ConfigInput(BaseModel):
-    model: str = Field(min_length=1, max_length=200)
-    base_url: str = Field(default="", max_length=2000)
-    api_key: str = Field(default="", max_length=2000)
-
-
-class MessageInput(BaseModel):
-    content: str = Field(min_length=1, max_length=32000)
-
-
-class ConfirmationInput(BaseModel):
-    turn_index: int = Field(ge=1)
-    tool_call_id: str = Field(min_length=1)
-    decision: str
-
-
 @app.get("/api/config")
 async def get_config():
     async with lock:
@@ -252,7 +252,8 @@ async def list_sessions():
 
 def _create_session():
     session = create_session_file(SESSIONS, secrets=session_secrets())
-    session.append_message(
+    sessions.append_message(
+        session,
         SystemMessage(content="你是助手。需要计算时使用计算器工具。"), None
     )
     return {"id": session.id}
@@ -268,7 +269,7 @@ def _get_session(session_id):
     session = session_or_404(session_id)
     return {
         "id": session.id,
-        "records": [record.model_dump(mode="json") for record in session.read()],
+        "records": [record.model_dump(mode="json") for record in sessions.read(session)],
     }
 
 
@@ -301,7 +302,7 @@ async def post_message(session_id: str, data: MessageInput):
 def _trace(session_id, run_id):
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", run_id):
         raise HTTPException(404, "运行不存在")
-    snapshot = session_or_404(session_id).trace(run_id)
+    snapshot = sessions.trace(session_or_404(session_id), run_id)
     if not snapshot:
         raise HTTPException(404, "运行不存在")
     return [event.model_dump(mode="json") for event in snapshot]
@@ -322,7 +323,7 @@ async def stream(session_id: str, run_id: str, request: Request, after: str = "0
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", run_id):
         raise HTTPException(404, "运行不存在")
     session = await run_sync(session_or_404, session_id)
-    snapshot = await run_sync(session.trace, run_id)
+    snapshot = await run_sync(sessions.trace, session, run_id)
     if not snapshot:
         raise HTTPException(404, "运行不存在")
     if cursor > snapshot[-1].seq:

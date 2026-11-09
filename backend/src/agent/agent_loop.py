@@ -6,12 +6,14 @@ import json
 import sys
 from typing import TYPE_CHECKING
 
-from pydantic import JsonValue, TypeAdapter
+from pydantic import BaseModel
 
 from .compact import CONTEXT_TOKENS, OUTPUT_TOKENS, PROMPT, Summary, size, split_recent
 from .security import check, contains
+from . import session as sessions
 from .session import release_run, run_sync
-from .tools.registry import declarations, get
+from .tools import todo
+from .tools.registry import declarations, parse_arguments
 from .types import (
     AssistantMessage,
     TextContent,
@@ -35,19 +37,19 @@ async def _finish(
     agent: Agent, run_id: str, status: str, answer: str = "", error: str | None = None
 ) -> None:
     state = agent.state
-    snapshot = await run_sync(agent.session.trace, run_id)
+    snapshot = await run_sync(sessions.trace, agent.session, run_id)
     if snapshot[-1].type not in {"run.completed", "run.finished"}:
         if state.stop and status != "failed":
             status = "stopped"
         if status == "completed":
             await run_sync(
-                agent.session.append_event, run_id, "run.completed", {"answer": answer}
+                sessions.record_event, agent.session, run_id, "run.completed", {"answer": answer}
             )
         else:
             data = {"status": status}
             if error is not None:
                 data["error"] = error
-            await run_sync(agent.session.append_event, run_id, "run.finished", data)
+            await run_sync(sessions.record_event, agent.session, run_id, "run.finished", data)
     state.condition.notify_all()
 
 
@@ -72,13 +74,10 @@ def _unsafe_exception(agent: Agent, error: BaseException | None) -> bool:
     return False
 
 
-def _validate_call(agent: Agent, call: ToolCallContent) -> None:
-    check(agent.session.guard, {"name": call.name, "arguments": call.arguments})
-    check(agent.session.guard, TypeAdapter(JsonValue).validate_json(call.arguments))
-    parameters = get(agent.registry, call.name).parameters.model_validate_json(
-        call.arguments
+def _validate_call(agent: Agent, call: ToolCallContent) -> BaseModel:
+    return parse_arguments(
+        agent.registry, call.name, call.arguments, secrets=agent.session.guard.secrets
     )
-    check(agent.session.guard, parameters)
 
 
 async def _compact_response(agent: Agent, messages: list):
@@ -129,7 +128,7 @@ async def run(agent: Agent, run_id: str) -> None:
                     await _finish(agent, run_id, "stopped")
                     return
                 messages = to_openai_messages(
-                    await run_sync(agent.session.context, run_id)
+                    await run_sync(sessions.context, agent.session, run_id)
                 )
                 tools = declarations(agent.registry)
                 input_size = size(messages) + size(tools)
@@ -140,13 +139,13 @@ async def run(agent: Agent, run_id: str) -> None:
                 compact = None
                 if not just_compacted and (
                     await run_sync(
-                        agent.session.context_tokens, run_id, agent.model, messages, tools
+                        sessions.context_tokens, agent.session, run_id, agent.model, messages, tools
                     )
                     + OUTPUT_TOKENS
                     > CONTEXT_TOKENS
                 ):
                     _, compact, recent = await run_sync(
-                        agent.session.context_parts, run_id
+                        sessions.context_parts, agent.session, run_id
                     )
                     older = split_recent(recent)
                 is_compact = bool(older)
@@ -166,7 +165,8 @@ async def run(agent: Agent, run_id: str) -> None:
                     if size(summary_messages) + size([]) > 80000:
                         raise ValueError("摘要请求超过输入上限")
                     await run_sync(
-                        agent.session.append_event,
+                        sessions.record_event,
+                        agent.session,
                         run_id,
                         "compact.request",
                         {
@@ -183,7 +183,8 @@ async def run(agent: Agent, run_id: str) -> None:
                         raise ValueError("上下文超过输入上限")
                     turn += 1
                     await run_sync(
-                        agent.session.append_event,
+                        sessions.record_event,
+                        agent.session,
                         run_id,
                         "model.request",
                         {
@@ -225,7 +226,8 @@ async def run(agent: Agent, run_id: str) -> None:
                     covered = list(compact.event.data["covered"]) if compact else []
                     covered.extend(r.id for r in older)
                     await run_sync(
-                        agent.session.append_event,
+                        sessions.record_event,
+                        agent.session,
                         run_id,
                         "compact.completed",
                         {
@@ -251,7 +253,7 @@ async def run(agent: Agent, run_id: str) -> None:
                         _validate_call(agent, call)
                     await _finish(agent, run_id, "stopped")
                     return
-                await run_sync(agent.session.append_message, message, run_id)
+                await run_sync(sessions.append_message, agent.session, message, run_id)
             for call in calls:
                 async with state.condition:
                     if state.shutdown:
@@ -264,7 +266,8 @@ async def run(agent: Agent, run_id: str) -> None:
                         {"name": call.name, "arguments": call.arguments},
                     )
                     await run_sync(
-                        agent.session.append_event,
+                        sessions.record_event,
+                        agent.session,
                         run_id,
                         "tool.started",
                         {
@@ -275,21 +278,17 @@ async def run(agent: Agent, run_id: str) -> None:
                         },
                     )
                     state.condition.notify_all()
-                    _validate_call(agent, call)
-                    tool = get(agent.registry, call.name)
-                    request = (
-                        await run_sync(
-                            tool.confirmation,
-                            tool.parameters.model_validate_json(call.arguments),
-                        )
-                        if tool.confirmation
-                        else None
-                    )
+                    parameters = _validate_call(agent, call)
+                    request = None
+                    if call.name == "todo" and parameters.action == "delete":
+                        items = await run_sync(sessions.todo_snapshot, agent.session)
+                        request = todo.confirmation_request(parameters, items)
                     if request is not None:
                         state.confirmation = (run_id, turn, call.id)
                         state.decision = None
                         await run_sync(
-                            agent.session.append_event,
+                            sessions.record_event,
+                            agent.session,
                             run_id,
                             "tool.confirmation_requested",
                             {
@@ -323,7 +322,8 @@ async def run(agent: Agent, run_id: str) -> None:
                         return not state.stop and not state.shutdown
 
                 result = await run_sync(
-                    agent.session.execute_tool,
+                    sessions.process_tool_call,
+                    agent.session,
                     agent.registry,
                     run_id,
                     turn,
@@ -336,7 +336,8 @@ async def run(agent: Agent, run_id: str) -> None:
                     state.condition.notify_all()
                     if result is not None:
                         await run_sync(
-                            agent.session.append_message,
+                            sessions.append_message,
+                            agent.session,
                             ToolResultMessage(tool_call_id=call.id, content=result),
                             run_id,
                         )
@@ -357,13 +358,15 @@ async def run(agent: Agent, run_id: str) -> None:
                 while state.queue:
                     queue_id, content = state.queue.popleft()
                     record = await run_sync(
-                        agent.session.append_message,
+                        sessions.append_message,
+                        agent.session,
                         UserMessage(content=content),
                         run_id,
                         queue_id=queue_id,
                     )
                     await run_sync(
-                        agent.session.append_event,
+                        sessions.record_event,
+                        agent.session,
                         run_id,
                         "steer.applied",
                         {"queue_id": queue_id, "message_id": record.id},

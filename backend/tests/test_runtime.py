@@ -1,11 +1,13 @@
+import asyncio
 import json
 from decimal import DivisionByZero
 
 import pytest
 from openai import AsyncOpenAI
 
+from src.agent import session as sessions
 from src.agent.compact import CONTEXT_TOKENS, OUTPUT_TOKENS, estimate_tokens, size
-from src.agent.runtime import append_message, close, create_agent, trace, wait
+from src.agent.runtime import append_message, close, confirm, create_agent, events, trace, wait
 from src.agent.session import create_session, open_session
 from src.agent.types import AssistantMessage, TextContent, UserMessage
 
@@ -45,8 +47,61 @@ async def test_real_loop_tool_and_conversation_history(model_server, tmp_path):
         await close(agent)
     reopened = open_session(tmp_path, session.id, secrets=())
     assert any(isinstance(r.message, AssistantMessage) and r.message.content == [TextContent(text='5')]
-               for r in reopened.read() if hasattr(r, 'message'))
+               for r in sessions.read(reopened) if hasattr(r, 'message'))
     assert len(requests) == 3
+
+
+async def test_split_secret_in_model_stream_is_not_persisted(model_server, tmp_path):
+    url, _, responses = model_server
+    responses.append([({'role': 'assistant', 'content': 'test-'}, None),
+                      ({'content': 'secret'}, None), ({}, 'stop')])
+    session = create_session(tmp_path, secrets=())
+    async with AsyncOpenAI(api_key='test-secret', base_url=url, max_retries=0) as client:
+        agent = await create_agent(session, client, 'fixture')
+        try:
+            run_id = await append_message(agent, 'hello')
+            with pytest.raises(ValueError, match='密钥'):
+                await wait(agent, run_id, timeout=10)
+            assert 'test-secret' not in session.path.read_text(encoding='utf-8')
+            assert (await trace(agent, run_id))[-1].data['status'] == 'failed'
+        finally:
+            await close(agent)
+
+
+@pytest.mark.parametrize('decision', ['approved', 'rejected'])
+async def test_delete_confirmation_through_agent_loop(model_server, tmp_path, decision):
+    url, _, responses = model_server
+    responses.extend([
+        tool_response('todo', {'action': 'add', 'title': 'A'}, 'add'), text_response('added'),
+        tool_response('todo', {'action': 'delete', 'id': 1}, 'delete'),
+    ])
+    if decision == 'approved':
+        responses.append(text_response('deleted'))
+    session = create_session(tmp_path, secrets=())
+    async with AsyncOpenAI(api_key='test-secret', base_url=url, max_retries=0) as client:
+        agent = await create_agent(session, client, 'fixture')
+        try:
+            added = await append_message(agent, '添加 A')
+            await wait(agent, added, timeout=10)
+            deleted = await append_message(agent, '删除 A')
+            async with asyncio.timeout(10):
+                async for event in events(agent, deleted):
+                    if event.type == 'tool.confirmation_requested':
+                        assert event.data['task'] == {'id': 1, 'title': 'A'}
+                        await confirm(agent, deleted, event.data['turn_index'], event.data['tool_call_id'], decision)
+                    if event.type in {'run.completed', 'run.finished'}:
+                        break
+            await wait(agent, deleted, timeout=10)
+            terminal = (await trace(agent, deleted))[-1]
+            if decision == 'approved':
+                assert terminal.type == 'run.completed'
+                assert sessions.todo_snapshot(session) == []
+            else:
+                assert terminal.data['status'] == 'stopped'
+                assert sessions.todo_snapshot(session) == [{'id': 1, 'title': 'A', 'status': 'pending'}]
+            assert responses == []
+        finally:
+            await close(agent)
 
 
 async def test_todo_isolation_and_reopen_without_replay(model_server, tmp_path):
@@ -61,11 +116,11 @@ async def test_todo_isolation_and_reopen_without_replay(model_server, tmp_path):
         assert (await trace(agent, run_id))[-1].type == 'run.completed'
         await close(agent)
     reopened = open_session(tmp_path, first.id, secrets=())
-    assert reopened.todo_snapshot() == [{'id': 1, 'title': 'A', 'status': 'pending'}]
-    assert second.todo_snapshot() == []
-    reopened.read()
-    reopened.recover()
-    assert reopened.todo_snapshot() == [{'id': 1, 'title': 'A', 'status': 'pending'}]
+    assert sessions.todo_snapshot(reopened) == [{'id': 1, 'title': 'A', 'status': 'pending'}]
+    assert sessions.todo_snapshot(second) == []
+    sessions.read(reopened)
+    sessions.recover(reopened)
+    assert sessions.todo_snapshot(reopened) == [{'id': 1, 'title': 'A', 'status': 'pending'}]
     assert len(requests) == 2
 
 
@@ -115,10 +170,10 @@ async def test_runtime_compacts_history_with_non_stream_summary(model_server, tm
         text_response('完成'),
     ])
     session = create_session(tmp_path, secrets=())
-    session.append_event('old', 'run.started', {'input': 'old'})
-    old_user = session.append_message(UserMessage(content='x' * 56000), 'old')
-    old_answer = session.append_message(AssistantMessage(content=[TextContent(text='earlier')]), 'old')
-    session.append_event('old', 'run.completed', {'answer': 'earlier'})
+    sessions.record_event(session, 'old', 'run.started', {'input': 'old'})
+    old_user = sessions.append_message(session, UserMessage(content='x' * 56000), 'old')
+    old_answer = sessions.append_message(session, AssistantMessage(content=[TextContent(text='earlier')]), 'old')
+    sessions.record_event(session, 'old', 'run.completed', {'answer': 'earlier'})
     async with AsyncOpenAI(api_key='test-secret', base_url=url, max_retries=0) as client:
         agent = await create_agent(session, client, 'fixture')
         run_id = await append_message(agent, 'y' * 17000)
@@ -148,10 +203,10 @@ async def test_compaction_continues_without_post_budget_check(model_server, tmp_
         text_response('done'),
     ])
     session = create_session(tmp_path, secrets=())
-    session.append_event('old', 'run.started', {'input': 'old'})
-    session.append_message(UserMessage(content='old'), 'old')
-    session.append_message(AssistantMessage(content=[TextContent(text='answer')]), 'old')
-    session.append_event('old', 'run.completed', {'answer': 'answer'})
+    sessions.record_event(session, 'old', 'run.started', {'input': 'old'})
+    sessions.append_message(session, UserMessage(content='old'), 'old')
+    sessions.append_message(session, AssistantMessage(content=[TextContent(text='answer')]), 'old')
+    sessions.record_event(session, 'old', 'run.completed', {'answer': 'answer'})
     async with AsyncOpenAI(api_key='test-secret', base_url=url, max_retries=0) as client:
         agent = await create_agent(session, client, 'fixture')
         try:
@@ -203,10 +258,10 @@ async def test_usage_changes_compaction_for_same_messages(model_server, tmp_path
     if should_compact:
         responses.append(text_response('third'))
     session = create_session(tmp_path, secrets=())
-    session.append_event('old', 'run.started', {'input': 'old'})
-    session.append_message(UserMessage(content='old' * 6000), 'old')
-    session.append_message(AssistantMessage(content=[TextContent(text='old answer')]), 'old')
-    session.append_event('old', 'run.completed', {'answer': 'old answer'})
+    sessions.record_event(session, 'old', 'run.started', {'input': 'old'})
+    sessions.append_message(session, UserMessage(content='old' * 6000), 'old')
+    sessions.append_message(session, AssistantMessage(content=[TextContent(text='old answer')]), 'old')
+    sessions.record_event(session, 'old', 'run.completed', {'answer': 'old answer'})
     async with AsyncOpenAI(api_key='test-secret', base_url=url, max_retries=0) as client:
         agent = await create_agent(session, client, 'fixture')
         try:
@@ -241,21 +296,21 @@ async def test_usage_baseline_and_new_tool_results(model_server, tmp_path, last_
             await wait(agent, run_id, timeout=10)
             messages = requests[1]['messages'] + [{'role': 'assistant', 'content': '5'}]
             tools = requests[1]['tools']
-            tokens = session.context_tokens(run_id, 'fixture', messages, tools)
+            tokens = sessions.context_tokens(session, run_id, 'fixture', messages, tools)
             if last_total:
                 assert tokens == last_total
             else:
                 assert tokens == 17000 + (size(messages[2:]) - size([])) / 4
-            assert session.context_tokens(run_id, 'different-model', messages, tools) == estimate_tokens(messages, tools)
-            assert session.context_tokens(run_id, 'fixture', messages, []) == estimate_tokens(messages, [])
-            session.append_event('next', 'run.started', {'input': 'next'})
-            session.append_message(UserMessage(content='next'), 'next')
+            assert sessions.context_tokens(session, run_id, 'different-model', messages, tools) == estimate_tokens(messages, tools)
+            assert sessions.context_tokens(session, run_id, 'fixture', messages, []) == estimate_tokens(messages, [])
+            sessions.record_event(session, 'next', 'run.started', {'input': 'next'})
+            sessions.append_message(session, UserMessage(content='next'), 'next')
             new_messages = messages + [{'role': 'user', 'content': 'next'}]
             if last_total:
                 expected = last_total + (size(new_messages[4:]) - size([])) / 4
             else:
                 expected = 17000 + (size(new_messages[2:]) - size([])) / 4
-            assert session.context_tokens('next', 'fixture', new_messages, tools) == expected
+            assert sessions.context_tokens(session, 'next', 'fixture', new_messages, tools) == expected
         finally:
             await close(agent)
 
@@ -273,7 +328,7 @@ async def test_missing_usage_estimates_complete_context(model_server, tmp_path, 
             await wait(agent, run_id, timeout=10)
             messages = requests[0]['messages'] + [{'role': 'assistant', 'content': 'ok'}]
             tools = requests[0]['tools']
-            assert session.context_tokens(run_id, 'fixture', messages, tools) == estimate_tokens(messages, tools)
+            assert sessions.context_tokens(session, run_id, 'fixture', messages, tools) == estimate_tokens(messages, tools)
         finally:
             await close(agent)
 
@@ -290,14 +345,14 @@ async def test_usage_boundary_and_failed_run_isolation(model_server, tmp_path):
             await wait(agent, first, timeout=10)
             messages = requests[0]['messages'] + [{'role': 'assistant', 'content': 'ok'}]
             tools = requests[0]['tools']
-            assert session.context_tokens(first, 'fixture', messages, tools) + OUTPUT_TOKENS == CONTEXT_TOKENS
+            assert sessions.context_tokens(session, first, 'fixture', messages, tools) + OUTPUT_TOKENS == CONTEXT_TOKENS
             second = await append_message(agent, 'next')
             with pytest.raises(ValueError):
                 await wait(agent, second, timeout=10)
-            session.append_event('third', 'run.started', {'input': 'after'})
-            session.append_message(UserMessage(content='after'), 'third')
+            sessions.record_event(session, 'third', 'run.started', {'input': 'after'})
+            sessions.append_message(session, UserMessage(content='after'), 'third')
             new_messages = messages + [{'role': 'user', 'content': 'after'}]
-            tokens = session.context_tokens('third', 'fixture', new_messages, tools)
+            tokens = sessions.context_tokens(session, 'third', 'fixture', new_messages, tools)
             assert tokens > 16000 and tokens < 50000
         finally:
             await close(agent)
@@ -321,10 +376,10 @@ async def test_tool_followup_changes_only_current_session(model_server, tmp_path
                 run_id = await append_message(agent, message)
                 await wait(agent, run_id, timeout=10)
                 assert (await trace(agent, run_id))[-1].type == 'run.completed'
-            assert open_session(tmp_path, first.id, secrets=()).todo_snapshot() == [
+            assert sessions.todo_snapshot(open_session(tmp_path, first.id, secrets=())) == [
                 {'id': 1, 'title': '后天交周报', 'status': 'pending'},
             ]
-            assert open_session(tmp_path, second.id, secrets=()).todo_snapshot() == [
+            assert sessions.todo_snapshot(open_session(tmp_path, second.id, secrets=())) == [
                 {'id': 1, 'title': '准备面试', 'status': 'pending'},
             ]
             assert len(requests) == 6

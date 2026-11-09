@@ -8,6 +8,7 @@ from uuid import uuid4
 from openai import AsyncOpenAI
 
 from .agent_loop import run
+from . import session as sessions
 from .security import SecretGuard, check, create_guard
 from .session import (
     Session,
@@ -76,10 +77,8 @@ async def create_agent(session: Session, client: AsyncOpenAI, model: str) -> Age
             session.guard = state.guard
         else:
             session.guard = guard
-        await run_sync(session.recover)
-    registry = create_registry(
-        None, session.todo_snapshot, todo_execute=session.execute_todo
-    )
+        await run_sync(sessions.recover, session)
+    registry = create_registry()
     return Agent(session, client, client.copy(), credentials, model, registry, state)
 
 
@@ -89,18 +88,18 @@ def _start_run(session: Session, run_id: str, content: str) -> None:
     started = False
     submitted = False
     try:
-        session.recover()
+        sessions.recover(session)
         with session.live_lock, _LIVE_RUNS_LOCK:
             _LIVE_RUNS.add(key)
-        session.append_event(run_id, "run.started", {"input": content})
+        sessions.record_event(session, run_id, "run.started", {"input": content})
         started = True
-        session.append_message(UserMessage(content=content), run_id)
+        sessions.append_message(session, UserMessage(content=content), run_id)
         submitted = True
     finally:
         if not submitted:
             try:
                 if started:
-                    session.append_event(run_id, "run.finished", {"status": "failed"})
+                    sessions.record_event(session, run_id, "run.finished", {"status": "failed"})
             finally:
                 with session.live_lock, _LIVE_RUNS_LOCK:
                     _LIVE_RUNS.discard(key)
@@ -128,7 +127,7 @@ async def _append_message(agent: Agent, content: str) -> str:
     async with state.condition:
         while state.active is not None:
             run_id = state.active
-            events = await run_sync(agent.session.trace, run_id)
+            events = await run_sync(sessions.trace, agent.session, run_id)
             if events and events[-1].type in {"run.completed", "run.finished"}:
                 await state.condition.wait_for(lambda: state.active != run_id)
                 continue
@@ -137,7 +136,8 @@ async def _append_message(agent: Agent, content: str) -> str:
             check(state.guard, content)
             queue_id = uuid4().hex
             await run_sync(
-                agent.session.append_event,
+                sessions.record_event,
+                agent.session,
                 run_id,
                 "steer.queued",
                 {"queue_id": queue_id, "content": content},
@@ -167,7 +167,8 @@ async def _append_message(agent: Agent, content: str) -> str:
             if not submitted:
                 try:
                     await run_sync(
-                        agent.session.append_event,
+                        sessions.record_event,
+                        agent.session,
                         run_id,
                         "run.finished",
                         {"status": "failed"},
@@ -190,7 +191,7 @@ def is_active(agent: Agent, run_id: str | None = None) -> bool:
 async def abort(agent: Agent, run_id: str) -> bool:
     state = agent.state
     async with state.condition:
-        events = await run_sync(agent.session.trace, run_id)
+        events = await run_sync(sessions.trace, agent.session, run_id)
         if not events:
             raise ValueError("运行不存在")
         if events[-1].type in {"run.completed", "run.finished"}:
@@ -227,7 +228,8 @@ async def _confirm(
         resolved = False
         try:
             await run_sync(
-                agent.session.append_event,
+                sessions.record_event,
+                agent.session,
                 run_id,
                 "tool.confirmation_resolved",
                 {
@@ -271,7 +273,7 @@ async def wait(agent: Agent, run_id: str, timeout: float | None = None) -> None:
 
 
 async def trace(agent: Agent, run_id: str) -> list[ExecutionEvent]:
-    return await run_sync(agent.session.trace, run_id)
+    return await run_sync(sessions.trace, agent.session, run_id)
 
 
 async def _notify(state: SessionState) -> None:
@@ -288,7 +290,7 @@ async def events(
     cursor = after
     while True:
         async with state.condition:
-            snapshot = await run_sync(agent.session.trace, run_id)
+            snapshot = await run_sync(sessions.trace, agent.session, run_id)
             if not snapshot or cursor > snapshot[-1].seq:
                 raise ValueError("无效事件游标")
             pending = [event for event in snapshot if event.seq > cursor]

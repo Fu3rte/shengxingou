@@ -5,7 +5,7 @@ from uuid import uuid4
 from filelock import AsyncFileLock
 from openai.types.chat import ChatCompletionChunk
 
-from .session import Session, run_sync
+from .session import Session, append_model_record, read, run_sync
 from .session_records import EventRecord, ExecutionEvent, TERMINAL, timestamp
 from ..ai.models.normalized import async_normalized_stream
 
@@ -26,7 +26,7 @@ def _begin_model_stream(
     session: Session, run_id: str, turn_index: int
 ) -> _ModelStreamState:
     with session.lock:
-        records = session.read()
+        records = read(session)
         events = [
             r.event
             for r in records
@@ -61,7 +61,7 @@ def _append_model_stream(
 ) -> ExecutionEvent:
     with session.lock:
         if _fingerprint(session) != state.fingerprint:
-            records = session.read()
+            records = read(session)
             events = [
                 r.event
                 for r in records
@@ -81,7 +81,7 @@ def _append_model_stream(
             data=data,
         )
         record = EventRecord(id=uuid4().hex, timestamp=now, event=event)
-        session.append_model_record(record, ids=state.ids)
+        append_model_record(session, record, ids=state.ids)
         state.ids.add(record.id)
         state.seq = event.seq
         state.fingerprint = _fingerprint(session)

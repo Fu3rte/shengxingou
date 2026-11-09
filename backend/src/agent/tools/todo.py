@@ -99,7 +99,7 @@ def delete(store: TodoList, item_id: int) -> dict:
         return dict(item)
 
 
-def execute(
+def apply_command(
     store: TodoList, command: TodoCommand, *, start: Callable[[], bool] | None = None
 ) -> str | None:
     if start is not None and not start():
@@ -193,12 +193,10 @@ def validate_delete_confirmation(
         raise ValueError("待办删除尚未确认")
 
 
-def confirmation_request(
-    command: TodoCommand, read_items: Callable[[], list[dict]]
-) -> dict | None:
+def confirmation_request(command: TodoCommand, items: list[dict]) -> dict | None:
     if command.action != "delete":
         return None
-    item = next((item for item in read_items() if item["id"] == command.id), None)
+    item = next((item for item in items if item["id"] == command.id), None)
     if item is None:
         raise ValueError("待办任务不存在")
     return {
@@ -213,7 +211,7 @@ def shared_snapshot(path: Path, lock: FileLock) -> list[dict]:
         return load_shared(path)[0]
 
 
-def execute_shared(
+def stage_change(
     command: TodoCommand,
     items: list[dict],
     next_id: int,
@@ -221,7 +219,7 @@ def execute_shared(
     start: Callable[[], bool] | None = None,
 ) -> tuple[str | None, TodoList]:
     store = restore(items, next_id)
-    return execute(store, command, start=start), store
+    return apply_command(store, command, start=start), store
 
 
 def commit_shared(path: Path, command: TodoCommand, store: TodoList, next_id: int) -> None:
