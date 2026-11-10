@@ -14,6 +14,7 @@ from openai import AsyncOpenAI
 from pydantic import BaseModel, Field
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
+from .agent.prompt import SYSTEM_PROMPT
 from .agent.runtime import (
     Agent,
     InvalidConfirmation,
@@ -254,7 +255,7 @@ def _create_session():
     session = create_session_file(SESSIONS, secrets=session_secrets())
     sessions.append_message(
         session,
-        SystemMessage(content="你是助手。需要计算时使用计算器工具。"), None
+        SystemMessage(content=SYSTEM_PROMPT), None
     )
     return {"id": session.id}
 

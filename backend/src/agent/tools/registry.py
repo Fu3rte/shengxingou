@@ -124,7 +124,7 @@ def create_registry(todo_list: TodoList | None = None) -> ToolRegistry:
         ),
         ToolDefinition(
             name="todo",
-            description="添加、查看、修改标题或状态、删除待办任务。",
+            description="添加、查看、修改标题或状态、删除待办任务。待办文件保存在项目根目录下的 backend/.data/sessions/.todo/，按会话分别存储。",
             parameters=TodoCommand,
             handler=partial(apply_command, todo_list) if todo_list is not None else None,
         ),
